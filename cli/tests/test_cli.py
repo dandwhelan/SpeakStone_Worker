@@ -82,11 +82,14 @@ def test_api_base_env_override(monkeypatch):
 
 
 # ------------------------------------------------------------------ setup
+WORKER_BODY = 'WORKER_VERSION = "1"\n' + "# worker script\n" * 100       # big enough not to look like a placeholder
+
+
 def make_env(tmp_path, calls, logs, fail_at=None, gpu=8192):
     res = tmp_path / "res"
     res.mkdir(parents=True, exist_ok=True)
     for n in setup.WORKER_FILES:
-        (res / n).write_text("# worker")
+        (res / n).write_text(WORKER_BODY)
     inst = tmp_path / "inst"
 
     def run(cmd, env, cwd, on_line):
@@ -116,7 +119,7 @@ def make_env(tmp_path, calls, logs, fail_at=None, gpu=8192):
         dest.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(dest, "w") as z:
             z.writestr("uv.exe" if "uv" in url else ("it/pyproject.toml" if "index-tts" in url else "bin/ffmpeg.exe"),
-                       "x" * 200)
+                       "x" * 200_000)
 
     def do_enroll():
         return {"key": KEY, "label": "Brave Otter", "worker_id": "w1", "tier": "new"}

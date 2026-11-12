@@ -576,6 +576,31 @@ def _any_exists(*paths):
     return any(Path(p).exists() for p in paths)
 
 
+MIN_TOOL_BYTES = 100_000        # uv and ffmpeg are programs of many MB; a few bytes is a placeholder, not an install
+MIN_WORKER_BYTES = 1_000        # the worker scripts are tens of KB
+
+
+def _big_enough(paths, minimum):
+    for p in paths:
+        try:
+            if Path(p).stat().st_size >= minimum:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def worker_files_ok(install):
+    """All three scripts present and not placeholders; net_worker.py must be the real worker (it names its version)."""
+    i = Path(install)
+    if not all(_big_enough([i / n], MIN_WORKER_BYTES) for n in WORKER_FILES):
+        return False
+    try:
+        return "WORKER_VERSION" in (i / "net_worker.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
 def config_has_key(path):
     """True when the worker's config file holds a worker key. The file merely existing is not enough: one PC had a
     config of `{}` and a finished setup, so the app never joined the queue and never said why."""
@@ -591,9 +616,9 @@ def artifact_ok(install, name):
     delete the venv or the model folder, and the step must then run again."""
     i = Path(install)
     if name == "worker_files":
-        return (i / "net_worker.py").exists()
+        return worker_files_ok(i)
     if name == "uv":
-        return _any_exists(i / "tools" / "uv.exe", i / "tools" / "uv")
+        return _big_enough([i / "tools" / "uv.exe", i / "tools" / "uv"], MIN_TOOL_BYTES)
     if name in ("python", "torch", "check"):
         return _any_exists(i / "venv" / "Scripts" / "python.exe", i / "venv" / "bin" / "python")
     if name == "packages":
@@ -605,7 +630,7 @@ def artifact_ok(install, name):
     if name == "extras":
         return extras_cached(i)
     if name == "ffmpeg":
-        return _any_exists(i / "ffmpeg" / "ffmpeg.exe", i / "ffmpeg" / "ffmpeg") or (
+        return _big_enough([i / "ffmpeg" / "ffmpeg.exe", i / "ffmpeg" / "ffmpeg"], MIN_TOOL_BYTES) or (
             sys.platform != "win32" and shutil.which("ffmpeg") is not None)
     if name == "enroll":
         return config_has_key(i / "worker_config.json")
