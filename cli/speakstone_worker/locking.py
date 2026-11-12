@@ -5,6 +5,26 @@ import sys
 from pathlib import Path
 
 
+def pid_alive(pid):
+    """Is that process still running? (Used for the tray's 'until I resume' flag.)"""
+    try:
+        pid = int(pid)
+        if sys.platform == "win32":
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)      # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(h)
+            return bool(ok) and code.value == 259                            # STILL_ACTIVE
+        import os
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def is_locked(path):
     """True when another process holds the lock. False when it is free, the file does not exist, or it cannot be told."""
     p = Path(path)

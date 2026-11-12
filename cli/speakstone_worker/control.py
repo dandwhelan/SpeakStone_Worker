@@ -6,6 +6,7 @@ import time
 WORKING, WAITING_WORK, PAUSED, WAITING_IDLE, UPDATING, STOPPED = (
     "Working", "Waiting for work", "Paused", "Waiting for the PC to be idle", "Updating", "Stopped")
 PAUSING, UPDATING_AFTER = "Pausing after this job", "Updating after this job"
+MAKING_IN_APP = "Making lines (started in the app window)"
 
 
 class Control:
@@ -18,6 +19,7 @@ class Control:
         self.update_version = None       # a newer version that is known but not installed yet
         self.drain_reason = None         # None, "pause" or "update": why the worker was asked to finish its job and leave
         self.drain_since = 0.0
+        self.force_start_until = 0.0     # after an update: start a worker at once (even if the PC is not idle) until this time
         self.paused_until = None         # epoch seconds when a timed pause ends; None = until the user resumes
 
     def set_paused(self, value):
@@ -57,7 +59,7 @@ def until_label(until):
     return time.strftime("%H:%M", time.localtime(until))
 
 
-def status_for(running, making, paused, updating=False, drain=None, until=None):
+def status_for(running, making, paused, updating=False, drain=None, until=None, foreign=False, lines=0):
     """The one-line status the tray shows. Pure. `drain` is control.drain_reason."""
     if updating:
         return UPDATING
@@ -67,6 +69,8 @@ def status_for(running, making, paused, updating=False, drain=None, until=None):
         if running:
             return PAUSING
         return f"{PAUSED} until {until_label(until)}" if until else PAUSED
+    if running and foreign:                      # a worker this service did not start (the app window's)
+        return MAKING_IN_APP + (f" - {lines} lines in this job" if lines else "")
     if running:
         return WORKING if making else WAITING_WORK
     return WAITING_IDLE

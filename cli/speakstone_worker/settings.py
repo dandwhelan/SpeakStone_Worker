@@ -14,6 +14,7 @@ DEFAULTS = {
     "block_on_battery": True,
     "workers": 1,               # workers on this card: 1, or 2 on a 12 GB+ card with room
     "paused_until": 0,          # epoch seconds: a timed pause from the tray, kept so it survives a restart; 0 = none
+    "start_on_open": True,      # opening the app starts making lines at once (the menu is one key away)
     "auto_update": True,        # fetch and install a newer release by itself; off = only say one is available
 }
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")

@@ -15,7 +15,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.live import Live
 
-from . import (APP_NAME, __version__, board, identity, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
+from . import (APP_NAME, __version__, board, identity, locking, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
                stats, tray as tray_mod, uninstall, update)
 from .keys import KeyReader, drain
 from .runner import WorkerGroup, install_close_handlers
@@ -300,13 +300,19 @@ def board_state(install, queue, gpu, state, started, now=None, events=None, work
     return s
 
 
-def start_now(console, install, settings, flow=None):
+def start_now(console, install, settings, flow=None, keep=None, respect_pause=False):
+    """The working board. `keep` holds the worker between the board and the menu, so [M] stops nothing and coming back
+    does not start a second one. `respect_pause`: an active pause set from the tray shows the board paused."""
+    keep = keep if keep is not None else {}
     if not ensure_setup(console, install):
         return "menu"
     fresh_screen(console)
     setup.sync_worker_files(install, paths.resource_dir())
-    runner = WorkerGroup(install, settings["workers"])
-    old = runner.find_existing()
+    runner = keep.get("runner")
+    reuse = runner is not None and runner.running
+    if not reuse:
+        runner = WorkerGroup(install, settings["workers"])
+    old = None if reuse else runner.find_existing()
     if old:
         console.print(f"\nA worker from an earlier window is still running (process {', '.join(map(str, old.values()))}).")
         console.print(f"  [{board.GOLD}][S][/] Stop it and start fresh    [{board.GOLD}][A][/] Attach to it (show the board)")
@@ -319,15 +325,17 @@ def start_now(console, install, settings, flow=None):
             runner = WorkerGroup(install, settings["workers"])
             old = None
     started, paused, paused_until, choosing = time.time(), False, None, False
+    if respect_pause and not reuse and not old:
+        paused, paused_until = pause_active(install, settings)
     ctl = control_mod.Control()
     if flow:
         flow.args = ["--start"]                      # an update while working restarts straight into making lines
     col = Collector(install, paths.api_base(), started)
     install_close_handlers(runner.shutdown_fast)
     watching = False
-    if not old and runner.busy_elsewhere():          # a worker with this key already runs (another window or the service)
+    if not old and not reuse and not paused and runner.busy_elsewhere():          # a worker with this key already runs (another window or the service)
         watching = True
-    if not old and not watching:
+    if not old and not watching and not reuse and not paused:
         runner.start()
     result = "menu"
     try:
@@ -388,7 +396,9 @@ def start_now(console, install, settings, flow=None):
             flow.args = []                         # back at the menu: an update restarts to the menu
         col.close()
         fresh_screen(console)                      # the board's screen is gone: land on a clean one
-        if runner.running:
+        if result == "menu":
+            keep["runner"] = runner                # [M] stops nothing: the worker keeps making lines behind the menu
+        elif runner.running:
             console.print("Giving the current job back before stopping...")
             runner.stop_and_wait()
     return result
@@ -408,10 +418,14 @@ def settings_menu(console, install, st):
         console.print(f"  [{board.GOLD}][5][/] Workers on this card: [bold]{st['workers']}[/]")
         console.print(f"  [{board.GOLD}][6][/] Remove SpeakStone Worker from this PC (deletes every downloaded file)")
         console.print(f"  [{board.GOLD}][7][/] Update automatically: [bold]{'on' if st['auto_update'] else 'off'}[/]")
+        console.print(f"  [{board.GOLD}][8][/] Start making lines when the app opens: "
+                      f"[bold]{'on' if st['start_on_open'] else 'off'}[/]")
         console.print(f"  [{board.GOLD}][B][/] Back")
         with KeyReader() as keys:
             k = keys.wait()
-        if k == "7":
+        if k == "8":
+            st["start_on_open"] = not st["start_on_open"]
+        elif k == "7":
             st["auto_update"] = not st["auto_update"]
         elif k == "6":
             if remove_program(console, install):
@@ -597,19 +611,32 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
     paused = in_pause_window(t.tm_hour * 60 + t.tm_min, st["pause_from"], st["pause_to"])
     if control is not None and control.paused:
         # the tray's Pause: finish the job in hand, take no new one (nothing is handed back)
-        if runner.running and control.drain_reason is None:
-            runner.request_drain()
+        foreign = not runner.running and _busy(runner)       # a worker started in the app window: pause it too
+        if (runner.running or foreign) and control.drain_reason is None:
+            if runner.running:
+                runner.request_drain()
+            else:
+                runner.drain_foreign()
             control.drain_reason = "pause"
         runner.poll_stop()
-        return "drain" if runner.running else "keep"
+        return "drain" if (runner.running or foreign) else "keep"
     if control is not None and control.drain_reason == "pause":      # Resume: cancel a drain that has not finished yet
         runner.clear_drain()
         control.drain_reason = None
     mode = "idle"
     if idle_s is None:                         # no idle time available: always on, at low priority
         mode, idle_s, runner.nice = "now", 0, True
-    action = idle.decide(mode, runner.running, idle_s, st["idle_minutes"], (r.get("fullscreen") or idle.fullscreen_busy)(),
-                         (r.get("battery") or idle.on_battery)(), paused, st["block_fullscreen"], st["block_on_battery"])
+    fullscreen, battery = (r.get("fullscreen") or idle.fullscreen_busy)(), (r.get("battery") or idle.on_battery)()
+    action = idle.decide(mode, runner.running, idle_s, st["idle_minutes"], fullscreen, battery, paused,
+                         st["block_fullscreen"], st["block_on_battery"])
+    if control is not None and control.force_start_until:
+        # it was working when an update restarted the program: carry on at once, even if the PC is not idle by the
+        # rule. The pause window, full-screen and battery blocks still win.
+        if runner.running or time.time() > control.force_start_until:
+            control.force_start_until = 0.0
+        elif action == "keep" and not paused and not (st["block_fullscreen"] and fullscreen) \
+                and not (st["block_on_battery"] and battery):
+            action = "start"
     if gate is not None:
         # a stop we asked for (idle ended, pause) is not a crash, whatever code a killed process leaves
         gate.observe(runner.running, 0 if runner.stop_asked_at or runner.running else _group_exit_code(runner))
@@ -623,6 +650,8 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
         action = "wait"                        # the worker left so the update can go in: do not start another
     if action == "start":
         runner.start()
+        if control is not None:
+            control.force_start_until = 0.0
         if gate is not None:
             gate.seen_running = True           # a refused key exits within seconds, before the next tick sees it run
     elif action == "stop":
@@ -631,6 +660,74 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
     if not runner.running:
         runner.stop_asked_at = 0.0
     return action
+
+
+def _busy(runner):
+    f = getattr(runner, "busy_elsewhere", None)
+    return bool(f and f())
+
+
+RESUME_MARKER = "update_resume.json"
+RESUME_VALID_SECONDS = 5 * 60
+PAUSE_FLAG = "paused_by_tray.json"
+
+
+def write_resume_marker(install, now=None):
+    """Just before an update swap that followed a drain: 'it was working', so the new process starts a worker at once."""
+    try:
+        Path(install).mkdir(parents=True, exist_ok=True)
+        (Path(install) / RESUME_MARKER).write_text(json.dumps({"at": now or time.time()}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def consume_resume_marker(install, now=None):
+    """True when a marker written at most 5 minutes ago exists. The file is removed either way."""
+    p = Path(install) / RESUME_MARKER
+    try:
+        at = float(json.loads(p.read_text(encoding="utf-8")).get("at", 0))
+    except (OSError, ValueError, AttributeError, TypeError):
+        at = 0.0
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    return bool(at) and 0 <= (now or time.time()) - at <= RESUME_VALID_SECONDS
+
+
+def clear_resume_marker(install):
+    try:
+        (Path(install) / RESUME_MARKER).unlink()
+    except OSError:
+        pass
+
+
+def write_pause_flag(install, pid=None):
+    try:
+        (Path(install) / PAUSE_FLAG).write_text(json.dumps({"pid": pid or os.getpid()}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_pause_flag(install):
+    try:
+        (Path(install) / PAUSE_FLAG).unlink()
+    except OSError:
+        pass
+
+
+def pause_active(install, st, now=None, alive=locking.pid_alive):
+    """(active, until) for a pause set from the tray: a timed one still running (saved in the settings) or an 'until I
+    resume' one whose service process is still alive. Read by an app window that is opening."""
+    now = now or time.time()
+    until = _setting(st, "paused_until", 0) or 0
+    if until > now:
+        return True, until
+    try:
+        pid = json.loads((Path(install) / PAUSE_FLAG).read_text(encoding="utf-8")).get("pid")
+    except (OSError, ValueError, AttributeError):
+        return False, None
+    return (True, None) if pid and alive(pid) else (False, None)
 
 
 def _setting(st, key, default=None):
@@ -687,10 +784,15 @@ def update_step(flow, control, st, runner, clock=time.time, drain_limit=DRAIN_LI
             flow.give_up()
             control.update_version = None
         return False
+    was_working = control.drain_reason == "update"
     control.drain_reason = None
     control.status = control_mod.UPDATING
     flow.log(f"update {flow.version}: restarting as the new version")
+    if was_working and flow.before_swap:
+        flow.before_swap()                      # the restarted service starts a worker at once
     note = flow.apply()
+    if was_working and flow.swap_failed:
+        flow.swap_failed()                      # still here: the swap did not happen, so no resume marker
     flow.forced = False
     flow.log(note)
     control.update_version = flow.version
@@ -715,11 +817,15 @@ def make_tray_actions(install, control, st, flow, open_board=tray_mod.open_board
             until = time.time() + minutes * 60 if minutes else None
             control.pause(until)
             st["paused_until"] = until or 0          # a timed pause is kept, so it survives a restart or an update
+            if until is None and install:
+                write_pause_flag(install)            # so an app window that opens knows (only while this service runs)
         return run
 
     def resume():
         control.set_paused(False)
         st["paused_until"] = 0
+        if install:
+            clear_pause_flag(install)
     acts = {k: pause_for(m) for k, _label, m in tray_mod.PAUSE_CHOICES}
     return {**acts, "resume": resume,
             "block_fullscreen": toggle("block_fullscreen"), "block_on_battery": toggle("block_on_battery"),
@@ -775,6 +881,16 @@ class ExitNote:
             pass
 
 
+def job_lines_now(install, workers=1, now=None):
+    """Lines in the job the log shows in hand (0 when none): the tray's line for a worker started in the app window."""
+    try:
+        dirs = [Path(install) / "work" / "logs"] + ([Path(install) / "work_2" / "logs"] if workers == 2 else [])
+        s = stats.merge_summaries([stats.summarize(stats.read_events(d), now or time.time()) for d in dirs])
+        return int(s.get("job_lines", 0)) if s.get("making") else 0
+    except Exception:
+        return 0
+
+
 def job_running_now(install, workers=1, now=None):
     """True when the log shows a claimed job that has not finished (drives the tray's 'Working' line)."""
     try:
@@ -802,7 +918,8 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
         note.write()
 
 
-def _background(install, st, note, flow, tray_start, making):
+def _background(install, st, note, flow, tray_start, making, job_lines=None):
+    job_lines = job_lines or job_lines_now
     hide_console()
     set_title(window_title("background"))
     if setup.is_set_up(install) and not setup.extras_cached(install):
@@ -819,7 +936,13 @@ def _background(install, st, note, flow, tray_start, making):
     flow.args = ["--background"]               # after an update the new process carries on as the service
     update.cleanup_old(flow.exe)
     control = control_mod.Control()
+    clear_pause_flag(install)                    # an 'until I resume' pause does not outlive the service process
     restore_pause(control, st)
+    if consume_resume_marker(install):           # an update restarted us while a worker was making lines
+        control.force_start_until = time.time() + RESUME_VALID_SECONDS
+        log("restarted after an update; starting the worker at once")
+    flow.before_swap = lambda: write_resume_marker(install)
+    flow.swap_failed = lambda: clear_resume_marker(install)
     runner = WorkerGroup(install, st["workers"])
 
     def on_close():                              # console closed, log-off, shutdown, SIGTERM/SIGBREAK/SIGHUP
@@ -830,7 +953,7 @@ def _background(install, st, note, flow, tray_start, making):
     gate = RestartGate()
     tray = tray_start(__version__, tray_state_reader(control, st, install), make_tray_actions(install, control, st, flow),
                       paths.assets_dir() / "icon.png", log)
-    last_making, making_now, next_label = 0.0, False, 0.0
+    last_making, making_now, next_label, lines_now = 0.0, False, 0.0, 0
     try:
         while not control.quit:
             try:
@@ -842,15 +965,18 @@ def _background(install, st, note, flow, tray_start, making):
                     ask_site_for_label(install)
                 pause_expiry_step(control, st)
                 background_tick(runner, st, gate=gate, control=control)    # first: claim at once when the rules allow
+                foreign = not runner.running and _busy(runner)      # making lines, but started in the app window
                 try:
-                    update_step(flow, control, st, runner)
+                    update_step(flow, control, st, runner, allow=not foreign)
                 except SystemExit:                  # a swap on Windows ends the process this way
                     note.updating = True
                     raise
-                if runner.running and time.time() - last_making > 10:
+                if (runner.running or foreign) and time.time() - last_making > 10:
                     making_now, last_making = making(install, st["workers"]), time.time()
-                control.status = control_mod.status_for(runner.running, making_now and runner.running, control.paused,
-                                                        drain=control.drain_reason, until=control.paused_until)
+                    lines_now = job_lines(install, st["workers"]) if foreign else 0
+                control.status = control_mod.status_for(runner.running or foreign, making_now and (runner.running or foreign),
+                                                        control.paused, drain=control.drain_reason,
+                                                        until=control.paused_until, foreign=foreign, lines=lines_now)
             except Exception as e:                  # one odd tick must not end the service
                 log(f"tick failed: {type(e).__name__}: {e}")
             time.sleep(5)
@@ -859,6 +985,7 @@ def _background(install, st, note, flow, tray_start, making):
     finally:
         if control.quit:
             note.set("quit from the tray")
+        clear_pause_flag(install)
         if tray:
             tray.stop()
         if runner.running:
@@ -867,10 +994,19 @@ def _background(install, st, note, flow, tray_start, making):
 
 
 # ---------------------------------------------------------------- main
+def auto_start_wanted(menu, start, st, install, is_set_up=None, read_key=None):
+    """A plain start (no arguments) on a finished setup that has a key goes straight to making lines. --menu or the
+    Settings toggle turns it off; --start is its own explicit request."""
+    if menu or start or not _setting(st, "start_on_open", True):
+        return False
+    return bool((is_set_up or setup.is_set_up)(install) and (read_key or identity.read_key)(install))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="speakstone_worker", description=APP_NAME)
     ap.add_argument("--background", action="store_true", help="run when the PC is idle (used by the service)")
     ap.add_argument("--start", action="store_true", help="skip the menu and start now")
+    ap.add_argument("--menu", action="store_true", help="open the menu without starting")
     ap.add_argument("--version", action="store_true")
     a = ap.parse_args(argv)
     if a.version:
@@ -890,15 +1026,20 @@ def main(argv=None):
         looker = threading.Thread(target=flow.check, daemon=True)
         looker.start()
     auto_tried = False
+    keep = {"runner": None}                            # the worker a window keeps while the menu is showing
+    # a plain start on a finished setup with a key goes straight to making lines; --menu or the setting turns it off
+    auto = auto_start_wanted(a.menu, a.start, st, install)
+    first = a.start or auto                            # the first start respects a pause set from the tray
     try:
-        choice = "1" if a.start else None
+        choice = "1" if (a.start or auto) else None
         while True:
             if choice is None:
                 if looker:
                     looker.join(1.5)                   # the first menu waits a moment for the answer, no longer
                     labeller.join(0.5)
                     looker = None
-                if flow.release and not auto_tried and st["auto_update"] and flow.can_apply()[0]:
+                working = keep["runner"] is not None and keep["runner"].running
+                if flow.release and not auto_tried and st["auto_update"] and flow.can_apply()[0] and not working:
                     auto_tried = True
                     console.print(f"Updating to {flow.version}...")
                     console.print(flow.apply())        # does not return when it worked
@@ -908,11 +1049,15 @@ def main(argv=None):
                 with KeyReader() as keys:
                     choice = keys.wait()
             if choice == "u" and flow.release:
-                console.print(flow.apply())
+                if keep["runner"] is not None and keep["runner"].running:
+                    console.print("Open the board: it updates after the job in hand.")
+                else:
+                    console.print(flow.apply())
                 time.sleep(2.5)
             elif choice == "1":
-                if start_now(console, install, st, flow) == "exit":
+                if start_now(console, install, st, flow, keep=keep, respect_pause=first) == "exit":
                     return 0
+                first = False
             elif choice == "2":
                 if service.is_installed():
                     console.print("Service removed." if service.uninstall() else "Could not remove the service.")
@@ -931,3 +1076,8 @@ def main(argv=None):
             choice = None
     except KeyboardInterrupt:
         return 0
+    finally:
+        kept = keep["runner"]
+        if kept is not None and kept.running:          # leaving the app stops the worker this window started
+            console.print("Giving the current job back before stopping...")
+            kept.stop_and_wait()

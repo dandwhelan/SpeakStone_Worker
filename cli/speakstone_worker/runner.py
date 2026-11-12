@@ -280,6 +280,14 @@ class WorkerRunner:
         """True when a worker with this config's key runs that this app did not start (another window, the service)."""
         return not self.running and locking.is_locked(self.lock_path)
 
+    def drain_foreign(self):
+        """Ask a worker we do not own to finish its job and leave (its STOP_AFTER_JOB file)."""
+        try:
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            (self.work_dir / DRAIN_FILE).write_text("drain", encoding="utf-8")
+        except OSError:
+            pass
+
     def stop_foreign(self):
         """Ask a worker we do not own to stop: its STOP file (it hands its job back)."""
         try:
@@ -390,6 +398,11 @@ class WorkerGroup:
 
     def busy_elsewhere(self):
         return any(r.busy_elsewhere() for r in self.active)
+
+    def drain_foreign(self):
+        for r in self.active:
+            if r.busy_elsewhere():
+                r.drain_foreign()
 
     def stop_foreign(self):
         for r in self.active:

@@ -381,6 +381,8 @@ class UpdateFlow:
                  args=None, clock=None, env=None, fetch_fn=fetch_verified):
         import time
         self.log, self.check_fn, self.apply_fn, self.fetch_fn = log, check_fn, apply_fn, fetch_fn
+        self.before_swap = None         # called just before a swap that follows a drain (writes the resume marker)
+        self.swap_failed = None
         self.staged = None              # a downloaded and proven new file, waiting for the swap
         self.frozen = getattr(sys, "frozen", False) if frozen is None else frozen
         self.exe = exe if exe is not None else (sys.executable if self.frozen else None)
