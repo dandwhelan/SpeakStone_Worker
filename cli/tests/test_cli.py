@@ -117,6 +117,11 @@ def make_env(tmp_path, calls, logs, fail_at=None, gpu=8192):
         import zipfile
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if url.endswith("/checksums.sha256"):             # the release's checksum list: the real hash of the archive
+            import hashlib
+            arc = next(p for p in dest.parent.glob("ffmpeg.*") if p.suffix in (".zip", ".xz"))
+            dest.write_text(hashlib.sha256(arc.read_bytes()).hexdigest() + "  " + setup.FFMPEG_URLS["win"].rsplit("/", 1)[1] + "\n")
+            return
         with zipfile.ZipFile(dest, "w") as z:
             z.writestr("uv.exe" if "uv" in url else ("it/pyproject.toml" if "index-tts" in url else "bin/ffmpeg.exe"),
                        "x" * 200_000)
@@ -126,6 +131,7 @@ def make_env(tmp_path, calls, logs, fail_at=None, gpu=8192):
 
     return setup.Env(inst, res, download=download, run=run, enroll=do_enroll, gpu_total_mib=lambda: gpu,
                      progress=lambda s, f, m: logs.append((s, m)), is_win=True,
+                     probe=lambda cmd, timeout: (0, "ffmpeg version test\n"),
                      base_env={"USERPROFILE": str(tmp_path / "nohome"), "HOME": str(tmp_path / "nohome")})
 
 

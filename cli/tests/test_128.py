@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT_DIR / "cli"))
 
 import pytest
 
@@ -169,3 +170,80 @@ def test_unexpected_error_in_check_is_logged_not_raised(tmp_path):
     f, _ = _flow(tmp_path, [KeyError("boom")], logs)
     assert f.check() is None
     assert len(logs) == 1 and "KeyError" in logs[0] and f.next_check - f.clock() == 120
+
+
+# ------------------------------------------------------------------ 4. the audio tool download is proven
+def _ffmpeg_env(tmp_path, sums="good", probe=(0, "ffmpeg version 7.0\n"), body=b"x" * 200_000):
+    import hashlib
+    import zipfile
+    from speakstone_worker import setup
+    seen = {"urls": []}
+
+    def download(url, dest, cb):
+        seen["urls"].append(url)
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if url.endswith("/checksums.sha256"):
+            if sums == "missing":
+                raise setup.SetupError("HTTP 404")
+            arc = (dest.parent / "ffmpeg.zip").read_bytes()
+            h = hashlib.sha256(arc).hexdigest() if sums == "good" else "0" * 64
+            dest.write_text(f"{h}  {setup.FFMPEG_URLS['win'].rsplit('/', 1)[1]}\n{'1' * 64}  other.zip\n")
+            return
+        with zipfile.ZipFile(dest, "w") as z:
+            z.writestr("bin/ffmpeg.exe", body)
+
+    env = setup.Env(tmp_path / "inst", tmp_path / "res", download=download, is_win=True,
+                    probe=lambda cmd, timeout: seen.setdefault("probe", (list(map(str, cmd)), timeout)) and probe)
+    return env, setup, seen
+
+
+def test_ffmpeg_download_is_checksummed_and_probed(tmp_path):
+    env, setup, seen = _ffmpeg_env(tmp_path)
+    setup.step_ffmpeg(env)
+    assert seen["urls"] == [setup.FFMPEG_URLS["win"], setup.FFMPEG_URLS["win"].rsplit("/", 1)[0] + "/checksums.sha256"]
+    assert (env.ffmpeg_dir / "ffmpeg.exe").stat().st_size == 200_000
+    assert seen["probe"][0][1:] == ["-version"] and seen["probe"][1] == 20
+    assert not (env.install / "ffmpeg.zip").exists()
+
+
+def test_ffmpeg_checksum_mismatch_deletes_archive_and_raises(tmp_path):
+    env, setup, _ = _ffmpeg_env(tmp_path, sums="bad")
+    with pytest.raises(setup.SetupError, match="checksum"):
+        setup.step_ffmpeg(env)
+    assert not (env.install / "ffmpeg.zip").exists() and not (env.ffmpeg_dir / "ffmpeg.exe").exists()
+
+
+def test_ffmpeg_without_a_checksum_list_is_not_installed(tmp_path):
+    env, setup, _ = _ffmpeg_env(tmp_path, sums="missing")
+    with pytest.raises(setup.SetupError, match="checked"):
+        setup.step_ffmpeg(env)
+    assert not (env.install / "ffmpeg.zip").exists() and not (env.ffmpeg_dir / "ffmpeg.exe").exists()
+
+
+@pytest.mark.parametrize("probe", [(1, "ffmpeg version 7\n"), (0, "something else"), (-1, "")])
+def test_ffmpeg_that_will_not_start_is_removed(tmp_path, probe):
+    env, setup, _ = _ffmpeg_env(tmp_path, probe=probe)
+    with pytest.raises(setup.SetupError, match="would not start"):
+        setup.step_ffmpeg(env)
+    assert not (env.ffmpeg_dir / "ffmpeg.exe").exists()
+
+
+def test_ffmpeg_placeholder_is_replaced_but_a_real_file_is_kept(tmp_path):
+    env, setup, seen = _ffmpeg_env(tmp_path)
+    env.ffmpeg_dir.mkdir(parents=True)
+    (env.ffmpeg_dir / "ffmpeg.exe").write_bytes(b"x")                   # a placeholder
+    setup.step_ffmpeg(env)
+    assert (env.ffmpeg_dir / "ffmpeg.exe").stat().st_size == 200_000 and seen["urls"]
+    seen["urls"].clear()
+    setup.step_ffmpeg(env)                                              # now a real size: nothing is fetched
+    assert seen["urls"] == []
+
+
+def test_checksum_line_parser():
+    from speakstone_worker import setup
+    h = "ab" * 32
+    assert setup._checksum_for(f"{h}  a.zip\n{'cd' * 32} *b.zip\n", "a.zip") == h
+    assert setup._checksum_for(f"{h}  a.zip\n{'cd' * 32} *b.zip\n", "b.zip") == "cd" * 32
+    assert setup._checksum_for(f"{h}  a.zip\n", "c.zip") is None
+    assert setup._checksum_for("nothex  a.zip\n", "a.zip") is None

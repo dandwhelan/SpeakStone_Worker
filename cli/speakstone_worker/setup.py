@@ -6,6 +6,7 @@ environment only: never a command line, never a log line, never a file of ours.
 
   uv (portable) -> Python 3.11 -> index-tts 830f6f8 -> packages -> torch (PINNED) -> model -> extras -> ffmpeg -> enrol -> check
 """
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -97,6 +99,7 @@ class Env:
     is_win: bool = field(default_factory=lambda: sys.platform == "win32")
     api_base: str = ""                                  # only passed to the worker when it is not the default
     machine_name: str = ""
+    probe: callable = None                              # (cmd list, timeout seconds) -> (exit code, output text); None = real
 
     @property
     def _exe(self):
@@ -196,6 +199,16 @@ def real_download(url, dest, progress=None):
             if progress:
                 progress(got / total if total else None, got, total)
     os.replace(part, dest)
+
+
+def real_probe(cmd, timeout):
+    """Run a short command and hand back (exit code, its output). Never hangs: a timeout is a failure (-1)."""
+    kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+    try:
+        r = subprocess.run([str(c) for c in cmd], stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, **kw)
+    except (OSError, subprocess.SubprocessError):
+        return -1, ""
+    return r.returncode, (r.stdout or b"").decode("utf-8", "replace")
 
 
 def real_run(cmd, env, cwd, on_line):
@@ -481,24 +494,64 @@ def step_extras(env):
     _run(env, "extras", [env.py, "-c", extras_code()], extra_env=HF_FAST_ENV)
 
 
+def _checksum_for(text, filename):
+    """The sha256 listed for `filename` in a `<hex>  <name>` checksum file, or None."""
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].lstrip("*") == filename and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            return parts[0].lower()
+    return None
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
 def step_ffmpeg(env):
+    """Download the audio tools and prove them: the archive must match the checksum the same release publishes, and the
+    program must start and say it is ffmpeg. A file that merely downloaded is not an install."""
     exe = "ffmpeg" + env._exe
-    if (env.ffmpeg_dir / exe).exists():
+    if _big_enough([env.ffmpeg_dir / exe], MIN_TOOL_BYTES):       # a tiny placeholder is replaced, not trusted
         return
     if not env.is_win and shutil.which("ffmpeg"):        # a system ffmpeg is fine
         return
+    url = FFMPEG_URLS[_plat(env)]
     z = env.install / ("ffmpeg.zip" if env.is_win else "ffmpeg.tar.xz")
-    env.download(FFMPEG_URLS[_plat(env)], z, lambda f, g=0, t=0: env.progress("ffmpeg", f, ""))
+    sums = env.install / "ffmpeg.checksums.sha256"
+    env.download(url, z, lambda f, g=0, t=0: env.progress("ffmpeg", f, ""))
+    try:
+        env.download(url.rsplit("/", 1)[0] + "/checksums.sha256", sums, lambda f, g=0, t=0: None)
+        want = _checksum_for(sums.read_text(encoding="utf-8", errors="replace"), url.rsplit("/", 1)[1])
+    except (OSError, SetupError, urllib.error.URLError) as e:
+        z.unlink(missing_ok=True)
+        raise SetupError(f"the audio tools could not be checked (the checksum list was not available: {e})") from None
+    finally:
+        sums.unlink(missing_ok=True)
+    if want is None or _file_sha256(z) != want:
+        z.unlink(missing_ok=True)
+        raise SetupError("the audio tools download did not match its checksum and was removed; start setup again")
     _extract(z, env.install / "_ff")
     found = next((p for p in (env.install / "_ff").rglob(exe) if p.is_file()), None)
     if not found:
         raise SetupError("the audio tools were not in the download")
     env.ffmpeg_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(found, env.ffmpeg_dir / exe)
+    target = env.ffmpeg_dir / exe
+    shutil.copy2(found, target)
     if not env.is_win:
-        (env.ffmpeg_dir / exe).chmod(0o755)
+        target.chmod(0o755)
     shutil.rmtree(env.install / "_ff", ignore_errors=True)
     z.unlink(missing_ok=True)
+    try:
+        rc, out = (env.probe or real_probe)([target, "-version"], 20)
+    except Exception:
+        rc, out = -1, ""
+    if rc != 0 or not (out or "").lstrip().startswith("ffmpeg version"):
+        target.unlink(missing_ok=True)
+        raise SetupError("the audio tools downloaded but would not start, so they were removed; start setup again")
 
 
 def step_enroll(env):
