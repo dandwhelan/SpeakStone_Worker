@@ -77,6 +77,8 @@ MAX_REF_BYTES = 20 * 1024 * 1024
 MAX_RESUME = 8
 YIELD_CHECK_SECONDS = 10    # spec 12a, yield
 YIELD_POLL_SECONDS = 20
+PRESENCE_SECONDS = 240      # while stepping aside (yield / vram) no call reaches the site: say "still here" this often
+PING_FAIL_LOG_SECONDS = 1800   # a failing presence call is logged at most this often
 MAX_RERUNS = 2            # reruns of indextts2_worker.py after the first run
 QC_TRIES = 3              # runpod_worker.QC_TRIES: a line held this many times is final
 HELD_DIR = "_held_qc"
@@ -878,9 +880,9 @@ class Api:
             raise NetError(f"HTTP {status}")
         return status, self._parse(body)
 
-    def get_me(self):
+    def get_me(self, present=False):
         h = {}
-        s, b = http_request("GET", self.base + "/api/worker/me",
+        s, b = http_request("GET", self.base + "/api/worker/me" + ("?present=1" if present else ""),
                             self._headers({"X-Worker-Protocol": str(PROTOCOL)}), timeout=self.timeout, resp_headers=h)
         return self._finish(s, b, h)
 
@@ -1357,6 +1359,9 @@ class Worker:
         self._signals = 0
         self._yield_at = 0.0
         self._yield_last = False
+        self.clock = time.monotonic  # tests replace this
+        self._ping_at = None         # when the last presence call (or the start of this idle spell) was
+        self._ping_fail_at = None
         self.engine = None           # EngineHost, created on the first job when engine_keep is on
         self.tier = None             # the key's tier from /api/worker/me
 
@@ -1596,10 +1601,37 @@ class Worker:
             self.tier = w.get("tier") if isinstance(w.get("tier"), str) else None
             self.log.event("start", None, label=str(w.get("label", ""))[:40], tier=w.get("tier"), status=w.get("status"))
 
+    def presence(self):
+        """While idle for yield or vram the worker calls nothing, so the site would show the PC as offline. Once every
+        PRESENCE_SECONDS, ask /api/worker/me?present=1 (the site counts that as 'seen'). Never raises, and never when a
+        stop or a drain (the user's pause) is wanted."""
+        now = self.clock()
+        if self._ping_at is None:                  # first idle moment of this spell: the last real call was just now
+            self._ping_at = now
+            return
+        if now - self._ping_at < PRESENCE_SECONDS or self.stop_requested() or self.drain_requested():
+            return
+        self._ping_at = now
+        try:
+            self.api.get_me(present=True)
+        except BaseException as e:                 # any failure, even a refused key: the main loop deals with those
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
+            if self._ping_fail_at is None or now - self._ping_fail_at >= PING_FAIL_LOG_SECONDS:
+                self._ping_fail_at = now
+                self.log.event("ping_failed", None, error=describe_exc(e))
+
     def wait_for_vram(self):
+        try:
+            self._wait_for_vram()
+        finally:
+            self._ping_at = None
+
+    def _wait_for_vram(self):
         while self.yield_busy(force=True):
             self.engine_shutdown("yield")          # local GPU work gets the engine's memory back
             self.log.event("idle", None, reason="yield", wait=YIELD_POLL_SECONDS)
+            self.presence()
             self.sleep(YIELD_POLL_SECONDS)
         need = self.cfg.need_free_mib
         if need <= 0 or self.skip_vram_wait:
@@ -1611,6 +1643,7 @@ class Worker:
             if free is None or free >= need:       # no nvidia-smi: cannot know, go on
                 return
             self.log.event("idle", None, reason="vram", free_mib=free, need_mib=need)
+            self.presence()
             self.sleep(VRAM_POLL_SECONDS)
 
     # ---- main loop
