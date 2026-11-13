@@ -211,14 +211,82 @@ def real_probe(cmd, timeout):
     return r.returncode, (r.stdout or b"").decode("utf-8", "replace")
 
 
-def real_run(cmd, env, cwd, on_line):
-    kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+SETUP_STALL_SECONDS = 1800      # a step that prints nothing for this long is stuck (a download that never ends)
+
+
+def setup_stall_seconds(env=None):
+    env = os.environ if env is None else env
+    try:
+        return max(1.0, float(env.get("SSW_SETUP_STALL_SECONDS") or SETUP_STALL_SECONDS))
+    except (TypeError, ValueError):
+        return float(SETUP_STALL_SECONDS)
+
+
+def _kill_tree(p):
+    """Kill a child and everything it started (Windows: taskkill /T, elsewhere: its process group). Never raises."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=20)
+        else:
+            import signal
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        p.kill()
+        p.wait(timeout=15)
+    except Exception:
+        pass
+
+
+def real_run(cmd, env, cwd, on_line, stall=None, clock=None, poll=0.5):
+    """Run a step and pass each output line to on_line, as always. New: if the child prints nothing for `stall` seconds
+    (default SETUP_STALL_SECONDS, SSW_SETUP_STALL_SECONDS overrides) its process tree is killed and SetupError says so,
+    so a step cannot hang for ever. `clock` and `poll` are arguments so tests need not wait half an hour."""
+    import queue
+    import time
+    stall = setup_stall_seconds() if stall is None else stall
+    clock = clock or time.monotonic
+    kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {"start_new_session": True}
     p = subprocess.Popen([str(c) for c in cmd], env=env, cwd=str(cwd) if cwd else None, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", **kw)
-    for line in p.stdout:
+    lines = queue.Queue()
+
+    def pump():
+        try:
+            for line in p.stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        lines.put(None)
+    threading.Thread(target=pump, daemon=True, name="step-output").start()
+    stuck = SetupError(f"this step printed nothing for {_how_long(stall)} and was stopped; start setup again")
+    last = clock()
+    while True:
+        try:
+            line = lines.get(timeout=max(0.01, min(poll, stall)))
+        except queue.Empty:
+            if clock() - last >= stall:
+                _kill_tree(p)
+                raise stuck
+            continue
+        if line is None:
+            break
+        last = clock()
         if on_line:
             on_line(line.rstrip())
-    return p.wait()
+    try:
+        return p.wait(timeout=stall)                    # output ended; a child that then never exits is stuck too
+    except subprocess.TimeoutExpired:
+        _kill_tree(p)
+        raise stuck
+
+
+def _how_long(seconds):
+    if seconds >= 120:
+        return f"{round(seconds / 60)} minutes"
+    return f"{round(seconds)} seconds" if seconds != 1 else "1 second"
 
 
 # ---------------------------------------------------------------- resume state

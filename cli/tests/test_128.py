@@ -247,3 +247,30 @@ def test_checksum_line_parser():
     assert setup._checksum_for(f"{h}  a.zip\n{'cd' * 32} *b.zip\n", "b.zip") == "cd" * 32
     assert setup._checksum_for(f"{h}  a.zip\n", "c.zip") is None
     assert setup._checksum_for("nothex  a.zip\n", "a.zip") is None
+
+
+# ------------------------------------------------------------------ 5. setup steps cannot hang for ever
+def test_silent_child_is_killed_with_a_plain_sentence():
+    from speakstone_worker import setup
+    seen = []
+    code = "import time; print('hello', flush=True); time.sleep(60)"
+    t0 = time.time()
+    with pytest.raises(setup.SetupError, match="printed nothing for 2 seconds and was stopped; start setup again"):
+        setup.real_run([sys.executable, "-c", code], dict(__import__("os").environ), None, seen.append, stall=2, poll=0.1)
+    assert time.time() - t0 < 20 and seen == ["hello"]
+
+
+def test_chatty_child_is_not_stalled_and_lines_and_exit_code_pass_through():
+    from speakstone_worker import setup
+    seen = []
+    code = "import time\nfor i in range(4):\n    print('line', i, flush=True); time.sleep(0.6)\nraise SystemExit(3)"
+    rc = setup.real_run([sys.executable, "-c", code], dict(__import__("os").environ), None, seen.append, stall=1.5, poll=0.1)
+    assert rc == 3 and seen == [f"line {i}" for i in range(4)]
+
+
+def test_stall_limit_from_environment():
+    from speakstone_worker import setup
+    assert setup.setup_stall_seconds({}) == 1800
+    assert setup.setup_stall_seconds({"SSW_SETUP_STALL_SECONDS": "60"}) == 60
+    assert setup.setup_stall_seconds({"SSW_SETUP_STALL_SECONDS": "x"}) == 1800
+    assert setup._how_long(1800) == "30 minutes"
