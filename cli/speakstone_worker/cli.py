@@ -830,6 +830,26 @@ def follow_installed_update(flow, runner, watching, state, clock=time.time, ever
     return flow.restart_as_installed()
 
 
+def service_follow_step(flow, runner, state, install, note=None):
+    """The background service's side of follow_installed_update: when the app WINDOW installed a newer version, the
+    service (and its tray icon) restarts as it. Until 1.2.9 only a window followed the service, never the other way
+    round, so the tray went on showing and running the old version (seen 2026-11-13). The service's own worker first
+    finishes its job and is started again by the new process; a worker that belongs to the window is left alone.
+    Does not return when it restarted."""
+    resume = bool(state.get("draining")) and not runner.running
+    if resume:
+        write_resume_marker(install)                 # the restarted service starts a worker at once
+    try:
+        done = follow_installed_update(flow, runner, False, state)
+    except SystemExit:
+        if note is not None:
+            note.updating = True
+        raise
+    if resume and not done:
+        clear_resume_marker(install)
+    return done
+
+
 DRAIN_LIMIT = 30 * 60           # how long an update waits for the job in hand before giving up for this round
 
 
@@ -1065,6 +1085,7 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None):
         runner.shutdown_fast()
     install_close_handlers(on_close)
     gate = RestartGate()
+    follow = {"looked": time.time()}
     tray = tray_start(__version__, tray_state_reader(control, st, install), make_tray_actions(install, control, st, flow),
                       paths.assets_dir() / "icon.png", log)
     last_making, making_now, next_label, lines_now = 0.0, False, 0.0, 0
@@ -1080,8 +1101,10 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None):
                 pause_expiry_step(control, st)
                 background_tick(runner, st, gate=gate, control=control)    # first: claim at once when the rules allow
                 foreign = not runner.running and _busy(runner)      # making lines, but started in the app window
+                service_follow_step(flow, runner, follow, install, note)     # the window updated the program: follow it
                 try:
-                    update_step(flow, control, st, runner, allow=not foreign)
+                    if not follow.get("draining"):
+                        update_step(flow, control, st, runner, allow=not foreign)
                 except SystemExit:                  # a swap on Windows ends the process this way
                     note.updating = True
                     raise
