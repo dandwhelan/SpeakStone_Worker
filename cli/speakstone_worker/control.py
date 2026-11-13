@@ -59,7 +59,12 @@ def until_label(until):
     return time.strftime("%H:%M", time.localtime(until))
 
 
-def status_for(running, making, paused, updating=False, drain=None, until=None, foreign=False, lines=0):
+IDLE_STATUS = {"yield": "Paused for another program using the graphics card", "vram": "Waiting for the graphics card",
+               "update_required": "Updating to a newer version"}
+
+
+def status_for(running, making, paused, updating=False, drain=None, until=None, foreign=False, lines=0,
+               idle_reason=None):
     """The one-line status the tray shows. Pure. `drain` is control.drain_reason."""
     if updating:
         return UPDATING
@@ -69,8 +74,10 @@ def status_for(running, making, paused, updating=False, drain=None, until=None, 
         if running:
             return PAUSING
         return f"{PAUSED} until {until_label(until)}" if until else PAUSED
-    if running and foreign:                      # a worker this service did not start (the app window's)
-        return MAKING_IN_APP + (f" - {lines} lines in this job" if lines else "")
-    if running:
-        return WORKING if making else WAITING_WORK
+    if running and making:
+        if foreign:                              # a worker this service did not start (the app window's)
+            return MAKING_IN_APP + (f" - {lines} lines in this job" if lines else "")
+        return WORKING
+    if running:                                  # idle: say why when the log does (a foreign worker used to say "Making")
+        return IDLE_STATUS.get(idle_reason, WAITING_WORK)
     return WAITING_IDLE

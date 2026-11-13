@@ -24,6 +24,14 @@ FONT = {
 }
 
 
+# Why the worker is idle, in the board's words (anything else, or no reason: it simply has no job).
+WAIT_TEXT = {
+    "yield": "Paused: another program on this PC is using the graphics card. It carries on by itself.",
+    "vram": "Waiting: the graphics card's memory is in use by another program.",
+    "update_required": "This version is too old for new work. Updating...",
+}
+
+
 def word_rows(word):
     return ["  ".join(FONT[c][r] for c in word) for r in range(5)]
 
@@ -156,7 +164,8 @@ def render_board(s):
             now.append(f"] {round(s.get('job_pct', 0.0) * 100)}%", style=DIM)
     else:
         now.append("> ", style=GOLD)
-        now.append("Waiting for work..." if state != "stopped" else (s.get("stop_note") or "Stopped."), style=DIM)
+        now.append(WAIT_TEXT.get(s.get("idle_reason"), "Waiting for work...") if state != "stopped"
+                   else (s.get("stop_note") or "Stopped."), style=DIM)
 
     ev = Text()
     rows = s.get("events") or []
@@ -165,7 +174,7 @@ def render_board(s):
     for i, (ts, kind, text, note) in enumerate(rows[:5]):
         import time as _t
         ev.append(_t.strftime("%H:%M", _t.localtime(ts)) + " ", style=DIM)
-        ev.append(f"{kind:<5} ", style={"done": GREEN, "retry": AMBER, "error": AMBER, "dropped": AMBER}.get(kind, PARCH))
+        ev.append(f"{kind:<5} ", style={"done": GREEN, "paused": AMBER, "retry": AMBER, "error": AMBER, "dropped": AMBER}.get(kind, PARCH))
         ev.append(text + " ", style=PARCH)
         if note:
             ev.append(f"({note})", style=DIM)

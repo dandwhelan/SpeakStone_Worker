@@ -76,12 +76,16 @@ def summarize(events, now, avg_job_seconds_default=60.0):
     day0 = local_midnight(now)
     out = {"lines": 0, "words": 0, "audio_min": 0.0, "lines_hour": 0, "words_hour": 0.0, "first_today": None,
            "making": False, "job": None, "job_lines": 0, "job_started": 0.0, "avg_job_seconds": avg_job_seconds_default,
-           "events": [], "spark": [0.0] * BUCKETS, "errors": 0, "dl_today": 0, "dl_job": 0}
+           "events": [], "idle_reason": None, "spark": [0.0] * BUCKETS, "errors": 0, "dl_today": 0, "dl_job": 0}
     buckets = [0.0] * BUCKETS
     seconds = []
     dl_by_job = {}                                  # bytes the worker itself fetched, per job
     for ts, ev, kv in events:
         job = kv.get("job", "-")
+        if ev in MAKING_EVENTS:
+            if out["idle_reason"] == "yield":       # work is back after stepping aside: say so once
+                out["events"].append((ts, "resumed", "the graphics card is free again", "carrying on"))
+            out["idle_reason"] = None
         if ev == "complete":
             n = _int(kv.get("ok")) + _int(kv.get("held"))
             w = _int(kv.get("words"))
@@ -111,9 +115,16 @@ def summarize(events, now, avg_job_seconds_default=60.0):
         elif ev == "fail":
             out["making"] = False
             out["events"].append((ts, "retry", f"job {job[:8]} - given back", kv.get("reason", "")))
-        elif ev == "idle" and kv.get("reason") == "update_required":
-            if not any(e[1] == "update" for e in out["events"][-3:]):
+        elif ev == "idle":
+            reason = kv.get("reason") or "none"
+            if reason == "yield" and out["idle_reason"] != "yield":      # one line when it starts, not one per 20 s
+                out["events"].append((ts, "paused", "another program is using the graphics card", ""))
+            elif reason != "yield" and out["idle_reason"] == "yield":
+                out["events"].append((ts, "resumed", "the graphics card is free again", "carrying on"))
+            if reason == "update_required" and not any(e[1] == "update" for e in out["events"][-3:]):
                 out["events"].append((ts, "update", "this version is too old for new work", "it updates itself"))
+            out["idle_reason"] = reason
+            out["making"] = False
         elif ev == "lease_lost":
             out["making"] = False
             out["events"].append((ts, "dropped", f"job {job[:8]}", "the queue gave it to someone else"))
@@ -126,7 +137,7 @@ def summarize(events, now, avg_job_seconds_default=60.0):
         elif ev == "error":
             out["errors"] += 1
             out["events"].append((ts, "error", kv.get("where", "worker"), "will retry"))
-        elif ev in ("idle", "stop"):
+        elif ev == "stop":
             out["making"] = False
     if out["making"] and now - out["job_started"] > 3 * 3600:
         out["making"] = False                       # a job cannot outlive the 3 h lease cap
@@ -204,6 +215,8 @@ def merge_summaries(parts):
     out["avg_job_seconds"] = sum(p["avg_job_seconds"] for p in parts) / len(parts)
     making = [p for p in parts if p["making"]]
     out["making"] = bool(making)
+    reasons = [p.get("idle_reason") for p in parts if not p["making"] and p.get("idle_reason")]
+    out["idle_reason"] = None if making else (reasons[0] if reasons else None)
     if making:
         best = max(making, key=lambda p: p["job_started"])
         out["job"], out["job_lines"], out["job_started"] = best["job"], best["job_lines"], best["job_started"]

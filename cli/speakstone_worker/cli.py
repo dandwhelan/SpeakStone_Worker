@@ -1033,6 +1033,16 @@ def job_running_now(install, workers=1, now=None):
         return False
 
 
+def idle_reason_now(install, workers=1, now=None):
+    """Why the log shows the worker idle (yield, vram, update_required, none), or None when it is not idle."""
+    try:
+        dirs = [Path(install) / "work" / "logs"] + ([Path(install) / "work_2" / "logs"] if workers == 2 else [])
+        s = stats.merge_summaries([stats.summarize(stats.read_events(d), now or time.time()) for d in dirs])
+        return s.get("idle_reason")
+    except Exception:
+        return None
+
+
 def background(install, st, flow=None, tray_start=tray_mod.start, making=job_running_now):
     """The service. Whatever ends it, one line in background.log says why (a hard kill cannot be logged)."""
     note = ExitNote(install)
@@ -1052,8 +1062,9 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
         note.write()
 
 
-def _background(install, st, note, flow, tray_start, making, job_lines=None):
+def _background(install, st, note, flow, tray_start, making, job_lines=None, idle_reason=None):
     job_lines = job_lines or job_lines_now
+    idle_reason = idle_reason or idle_reason_now
     hide_console()
     set_title(window_title("background"))
     if setup.is_set_up(install) and not setup.extras_cached(install):
@@ -1088,7 +1099,7 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None):
     follow = {"looked": time.time()}
     tray = tray_start(__version__, tray_state_reader(control, st, install), make_tray_actions(install, control, st, flow),
                       paths.assets_dir() / "icon.png", log)
-    last_making, making_now, next_label, lines_now = 0.0, False, 0.0, 0
+    last_making, making_now, next_label, lines_now, reason_now = 0.0, False, 0.0, 0, None
     try:
         while not control.quit:
             try:
@@ -1111,9 +1122,11 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None):
                 if (runner.running or foreign) and time.time() - last_making > 10:
                     making_now, last_making = making(install, st["workers"]), time.time()
                     lines_now = job_lines(install, st["workers"]) if foreign else 0
+                    reason_now = idle_reason(install, st["workers"]) if not making_now else None
                 control.status = control_mod.status_for(runner.running or foreign, making_now and (runner.running or foreign),
                                                         control.paused, drain=control.drain_reason,
-                                                        until=control.paused_until, foreign=foreign, lines=lines_now)
+                                                        until=control.paused_until, foreign=foreign, lines=lines_now,
+                                                        idle_reason=reason_now)
             except Exception as e:                  # one odd tick must not end the service
                 log(f"tick failed: {type(e).__name__}: {e}")
             time.sleep(5)
