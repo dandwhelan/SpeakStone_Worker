@@ -75,6 +75,9 @@ HF_CACHE = pin_hf_cache()
 ENGINE = "indextts2"
 MODEL_REPO = "IndexTeam/IndexTTS-2"
 MODEL_DIR = Path(os.environ.get("INDEXTTS2_DIR", str(Path(__file__).resolve().parent / "models" / "IndexTTS-2")))
+# IndexTTS-2's accel engine uses flash-attn and samples with temperature only. It ignores num_beams, top_k, top_p and
+# repetition_penalty (gpt/model_v2.py inference_speech at commit 830f6f8), so its takes do not follow the recipe.
+USE_ACCEL = os.environ.get("IDX2_USE_ACCEL") == "1"
 EMO_ALPHA = 1.0          # the table below is the effective strength: the vector goes in as written (total capped at 0.8)
 
 # The row's line_emotion -> IndexTTS-2's emotion vector
@@ -236,7 +239,9 @@ def load_model(device):
     tts = IndexTTS2(cfg_path=str(MODEL_DIR / "config.yaml"), model_dir=str(MODEL_DIR), use_fp16=(device == "cuda"),
                     device=device, use_cuda_kernel=os.environ.get("IDX2_CUDA_KERNEL") == "1",
                     use_deepspeed=os.environ.get("IDX2_DEEPSPEED") == "1",
-                    use_accel=os.environ.get("IDX2_USE_ACCEL") == "1")   # needs flash-attn; timing test 2026-11-07
+                    use_accel=USE_ACCEL)   # needs flash-attn; timing test 2026-11-07
+    if USE_ACCEL:
+        print("[warn] IDX2_USE_ACCEL=1: the accel engine ignores num_beams and repetition_penalty", file=sys.stderr)
     # The text-emotion model (Qwen 0.6B, ~1.2 GB on the GPU) is only used for emo_text; we always give an emotion VECTOR, so it
     # sits idle. On an 8 GB RunPod RTX 3070 the worker died with CUDA out of memory on the first long line (2026-11-04: beam-search
     # cache, 7.64 GiB in use); on Windows the driver spills into system RAM, which hid it here. Freeing it changes no output.
@@ -362,7 +367,7 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
             pool = ThreadPoolExecutor(max_workers=2)
             futs = []
 
-            def finish(row, fp, seed, vec, sr, w, wav_path, ogg_path, t_infer):
+            def finish(row, fp, seed, vec, beams, sr, w, wav_path, ogg_path, t_infer):
                 sf_name = row["sound_file"]
                 text = row["cleaned_text"]
                 t_fin = time.time()
@@ -384,12 +389,13 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                         held_dir = out / rw.QC_HELD_DIR
                         held_dir.mkdir(exist_ok=True)
                         os.replace(str(ogg_path), str(held_dir / sf_name))
-                        with open(qc_log, "a", encoding="utf-8") as qf:
-                            qf.write(json.dumps({"sound_file": sf_name, "why": why, "duration_sec": round(dur, 3),
-                                                 "generation_seed": seed, "profile_key": row["profile_key"],
-                                                 "npc_name": row.get("npc_name", ""), "hostname": host, "engine": ENGINE,
-                                                 "timestamp": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False) + "\n")
-                        with lock:
+                        rec = json.dumps({"sound_file": sf_name, "why": why, "duration_sec": round(dur, 3),
+                                          "generation_seed": seed, "profile_key": row["profile_key"],
+                                          "npc_name": row.get("npc_name", ""), "hostname": host, "engine": ENGINE,
+                                          "timestamp": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False)
+                        with lock:      # two finish threads can hold lines at the same moment, so writes take the lock
+                            with open(qc_log, "a", encoding="utf-8") as qf:
+                                qf.write(rec + "\n")
                             stats['held'] += 1
                         print(f"[QC] held {sf_name}: {why}", flush=True)
                         return
@@ -400,7 +406,7 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                            "canonical_reference_clip": row["canonical_reference_clip"], "ref_text": row.get("ref_text", ""),
                            "model_engine": ENGINE, "model_revision": revision, "generation_seed": seed,
                            "line_emotion": row.get("line_emotion", ""), "emo_vector": vec, "emo_alpha": EMO_ALPHA if vec else None,
-                           "num_beams": beams_for(vec),
+                           "num_beams": 1 if USE_ACCEL else beams,   # the accel engine ignores num_beams
                            "post_af": row.get("post_af", ""), "bitrate": bitrate,
                            "measured_lufs": (level or {}).get("measured_lufs"), "level": (level or {}).get("level"),
                            "level_recipe": (level or {}).get("level_recipe"), "duration_sec": round(dur, 3),
@@ -428,8 +434,10 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                 seed = rw.compute_generation_seed(row) + qc_held.get(sf_name, 0)   # a held take retries on the next seed
                 vec = emotion_vector(row)
                 beams = int(row["num_beams"]) if row.get("num_beams") else beams_for(vec)
-                wav_path = tmp / f"t_{os.getpid()}_{time.time_ns()}.wav"
-                ogg_path = tmp / f"t_{os.getpid()}_{time.time_ns()}.ogg"
+                # Named by the line's place in the batch, not the clock. Two lines made close together could get the
+                # same time_ns() on Windows, and the two finish threads then wrote and moved each other's files.
+                wav_path = tmp / f"t_{os.getpid()}_{i}.wav"
+                ogg_path = tmp / f"t_{os.getpid()}_{i}.ogg"
                 t0 = time.time()
                 try:
                     random.seed(seed)
@@ -488,7 +496,7 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                         pool.shutdown(wait=True)
                         raise
                     continue
-                futs.append(pool.submit(finish, row, fp, seed, vec, sr, w, wav_path, ogg_path, time.time() - t0))
+                futs.append(pool.submit(finish, row, fp, seed, vec, beams, sr, w, wav_path, ogg_path, time.time() - t0))
                 if len(futs) > 8:                 # keep the backlog (and held audio arrays) small
                     futs.pop(0).result()
                 if i % 25 == 0:

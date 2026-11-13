@@ -1065,8 +1065,10 @@ def test_never_offline_and_hf_urls_stay_readable(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     monkeypatch.setenv("HF_HOME", "C:/inst/hf")
+    monkeypatch.setenv("IDX2_USE_ACCEL", "1")
     e = w.synth_env()
     assert "HF_HUB_OFFLINE" not in e and "TRANSFORMERS_OFFLINE" not in e and e["HF_HOME"] == "C:/inst/hf"
+    assert "IDX2_USE_ACCEL" not in e       # it changes the recipe, so it never reaches a site job
     log = nw.Log(tmp_path, key="", echo=False)
     msg = "We couldn't connect to 'https://huggingface.co/funasr/campplus/resolve/main/x.bin' and https://evil.example/a"
     assert "huggingface.co/funasr/campplus" in log._clean(msg) and "evil.example" not in log._clean(msg)

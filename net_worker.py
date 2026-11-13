@@ -66,7 +66,7 @@ STALL_MIN_SECONDS = 120
 STALL_CHECK_SECONDS = 2     # how often the progress signature is looked at (a folder listing is cheap, not free)
 ENGINE_READY_MARKER = "[ENGINE-READY]"
 ENGINE_DONE_RE = re.compile(r"^\[JOB-DONE\] rc=(-?\d+)\s*$")
-UPLOAD_THREADS = 4
+UPLOAD_THREADS = 10       # a job is about 10 small clips and each PUT opens a new TLS connection, so all go at once
 FINISH_GRACE_SECONDS = 120   # a finished job may still upload and complete for this long after a stop is asked for
 BACKOFF_START = 5
 BACKOFF_CAP = 300
@@ -1979,7 +1979,10 @@ class Worker:
         env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         for k in OFFLINE_ENV:
             env.pop(k, None)
-        for k in ("IDX2_NUM_BEAMS", "IDX2_BEAMS_BY_EMOTION", "SSW_WORKER_KEY", "WORKER_KEY", "SSW_VERCEL_BYPASS"):
+        # IDX2_USE_ACCEL is removed as well. The accel engine skips beam search and repetition_penalty, so a site job
+        # would be made differently from what its manifest reports.
+        for k in ("IDX2_NUM_BEAMS", "IDX2_BEAMS_BY_EMOTION", "IDX2_USE_ACCEL", "SSW_WORKER_KEY", "WORKER_KEY",
+                  "SSW_VERCEL_BYPASS"):
             env.pop(k, None)
         key = self.cfg.worker_key
         if key:                                  # no variable of any name may carry the key (or a config path that holds it)
