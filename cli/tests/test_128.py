@@ -342,3 +342,19 @@ def test_background_log_is_cut_to_its_tail_only_when_large(tmp_path):
     assert 150_000 < len(data) <= cli.BACKGROUND_LOG_KEEP and data.endswith(lines[-1]) and data.startswith("2026")
     assert cli.trim_background_log(log) is False                         # small now: left alone
     assert cli.trim_background_log(tmp_path / "nope.log") is False
+
+
+# ------------------------------------------------------------------ 7. the service restarts after a crash
+def test_task_xml_restarts_after_a_crash_in_schema_order():
+    import xml.etree.ElementTree as ET
+    from speakstone_worker import service
+    xml = service.build_task_xml("prog", ["--background"])
+    root = ET.fromstring(xml.split("?>", 1)[1])
+    ns = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+    settings = root.find(ns + "Settings")
+    names = [c.tag.replace(ns, "") for c in settings]
+    assert names == ["RestartOnFailure", "MultipleInstancesPolicy", "DisallowStartIfOnBatteries",
+                     "StopIfGoingOnBatteries", "StartWhenAvailable", "Enabled", "Hidden", "ExecutionTimeLimit"]
+    r = settings.find(ns + "RestartOnFailure")
+    assert r.find(ns + "Interval").text == "PT1M" and r.find(ns + "Count").text == "3"
+    assert settings.find(ns + "ExecutionTimeLimit").text == "PT0S"
