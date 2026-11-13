@@ -265,7 +265,10 @@ class GpuMonitor:
 
     def _loop3d(self):
         while self.d3_ok:
-            self.sample3d()
+            try:
+                self.sample3d()
+            except Exception:                  # one bad reading must not end the thread; try again in 2 s
+                pass
             time.sleep(2)
 
     def sample3d(self):

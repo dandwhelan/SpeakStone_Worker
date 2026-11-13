@@ -270,7 +270,10 @@ class Collector:
 
     def _loop(self):
         while not self._stop:
-            self.queue = stats.fetch_queue(self.api)
+            try:
+                self.queue = stats.fetch_queue(self.api)
+            except Exception:                  # keep the last answer and ask again in 30 s
+                pass
             for _ in range(30):
                 if self._stop:
                     return
@@ -628,6 +631,14 @@ def trim_background_log(path, max_bytes=BACKGROUND_LOG_MAX, keep=BACKGROUND_LOG_
         return True
     except OSError:
         return False
+
+
+def safe_check(flow, install):
+    """flow.check() for a thread: whatever goes wrong becomes one line in background.log, never a dead thread."""
+    try:
+        flow.check()
+    except Exception as e:
+        log_background_error(install, f"update check failed: {type(e).__name__}: {e}")
 
 
 def background_tick(runner, st, now=None, readers=None, gate=None, control=None):
@@ -1083,7 +1094,7 @@ def main(argv=None):
     labeller = threading.Thread(target=lambda: identity.refresh(install, paths.api_base()), daemon=True)
     labeller.start()                                   # the worker's label, when it is not known yet
     if not update.disabled():                          # a short, silent look in the background; never blocks the menu
-        looker = threading.Thread(target=flow.check, daemon=True)
+        looker = threading.Thread(target=lambda: safe_check(flow, install), daemon=True)
         looker.start()
     auto_tried = False
     keep = {"runner": None}                            # the worker a window keeps while the menu is showing

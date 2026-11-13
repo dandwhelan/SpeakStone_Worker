@@ -368,3 +368,49 @@ def test_worker_version_matches_the_app_version():
     m = re.search(r'^WORKER_VERSION\s*=\s*"([^"]+)"', (ROOT_DIR / "net_worker.py").read_text(encoding="utf-8"), re.M)
     assert m and m.group(1) == __version__ == "1.2.8"
     assert nw.WORKER_VERSION == __version__
+
+
+# ------------------------------------------------------------------ 9. threads do not die silently
+def test_tray_poll_survives_a_failing_refresh():
+    import threading
+    from speakstone_worker import tray
+    t = tray.Tray.__new__(tray.Tray)
+    t._stop = threading.Event()
+    t.poll_seconds = 0.01
+    n = []
+
+    def refresh():
+        n.append(1)
+        if len(n) >= 3:
+            t._stop.set()
+        raise RuntimeError("log call failed too")
+    t.refresh = refresh
+    t._poll()
+    assert len(n) == 3
+
+
+def test_stats_3d_loop_survives_a_failing_reading(monkeypatch):
+    from speakstone_worker import stats
+    g = stats.GpuMonitor(reader=lambda: None, d3_reader=lambda: None, windows=True, start_thread=False)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        if len(calls) >= 3:
+            g.d3_ok = False
+        raise OSError("typeperf gone")
+    g.d3_reader = boom
+    monkeypatch.setattr(stats.time, "sleep", lambda s: None)
+    g._loop3d()
+    assert len(calls) == 3
+
+
+def test_safe_check_logs_one_line_and_never_raises(tmp_path):
+    from speakstone_worker import cli
+
+    class Flow:
+        def check(self):
+            raise ValueError("weird")
+    cli.safe_check(Flow(), tmp_path)
+    text = (tmp_path / "work" / "logs" / "background.log").read_text()
+    assert text.count("\n") == 1 and "update check failed: ValueError: weird" in text

@@ -123,7 +123,10 @@ class Tray:
 
     def _poll(self):
         while not self._stop.wait(self.poll_seconds):
-            self.refresh()
+            try:
+                self.refresh()
+            except Exception:                  # refresh logs its own errors; a failing log call must not end polling
+                pass
 
     def start(self):
         self.icon.run_detached()
