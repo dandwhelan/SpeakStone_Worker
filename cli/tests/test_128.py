@@ -109,3 +109,63 @@ def test_error_boxes_are_switched_off_and_never_raise(monkeypatch, modname):
     ns["no_error_boxes"]()                                              # an error is swallowed
     monkeypatch.setattr(sys, "platform", "linux")
     ns["no_error_boxes"]()                                              # and other systems do nothing
+
+
+# ------------------------------------------------------------------ 3. update check retries sooner after a failure
+def _flow(tmp_path, errors, logs):
+    from test_update_tray import make_flow
+    from speakstone_worker import update
+    f = make_flow(tmp_path, log=logs.append)
+    it = iter(errors)
+
+    def check_fn(env=None):
+        e = next(it)
+        if e is not None:
+            raise e
+        return None
+    f.check_fn = check_fn
+    return f, update
+
+
+def test_failed_checks_back_off_2_5_15_60_and_log_once(tmp_path):
+    logs = []
+    from speakstone_worker import update
+    down = update.UpdateError("could not reach the release page")
+    f, _ = _flow(tmp_path, [down] * 6 + [None], logs)
+    gaps = []
+    for _ in range(6):
+        t0 = f.clock()
+        assert f.check() is None
+        gaps.append(f.next_check - t0)
+    assert gaps == [120, 300, 900, 3600, 3600, 3600]
+    assert logs == ["update check: could not reach the release page"]          # one line for the whole run of failures
+    t0 = f.clock()
+    f.check()                                                                  # success: back to the normal interval
+    assert f.next_check - t0 == update.CHECK_EVERY and f.failures == 0
+
+
+def test_a_different_failure_message_is_logged_and_a_later_run_logs_again(tmp_path):
+    logs = []
+    from speakstone_worker import update
+    a, b = update.UpdateError("a"), update.UpdateError("b")
+    f, _ = _flow(tmp_path, [a, a, b, None, a], logs)
+    for _ in range(5):
+        f.check()
+    assert logs == ["update check: a", "update check: b", "update check: a"]
+
+
+def test_switched_off_keeps_six_hours(tmp_path):
+    logs = []
+    from speakstone_worker import update
+    f, _ = _flow(tmp_path, [update.UpdateError(update.SWITCHED_OFF)], logs)
+    t0 = f.clock()
+    f.check()
+    assert f.next_check - t0 == update.CHECK_EVERY and f.failures == 0
+    assert update.SWITCHED_OFF == "updates are switched off (SSW_NO_UPDATE)"
+
+
+def test_unexpected_error_in_check_is_logged_not_raised(tmp_path):
+    logs = []
+    f, _ = _flow(tmp_path, [KeyError("boom")], logs)
+    assert f.check() is None
+    assert len(logs) == 1 and "KeyError" in logs[0] and f.next_check - f.clock() == 120

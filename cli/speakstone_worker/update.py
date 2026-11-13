@@ -31,6 +31,8 @@ MIN_BYTES = 5_000_000                       # the real program is far larger; an
 CHECK_TIMEOUT = 8
 DOWNLOAD_TIMEOUT = 120
 CHECK_EVERY = 6 * 3600
+RETRY_AFTER_FAILURE = (120, 300, 900, 3600)   # seconds before the next look after 1, 2, 3, 4+ failed checks in a row
+SWITCHED_OFF = "updates are switched off (SSW_NO_UPDATE)"
 RESET_ENV = "PYINSTALLER_RESET_ENVIRONMENT"  # a one-file program starting itself must unpack afresh, not reuse ours
 
 Release = namedtuple("Release", "version asset_url sha_url")
@@ -127,7 +129,7 @@ def check(current=__version__, env=None, platform=None, get=http_get):
     import json
     env = os.environ if env is None else env
     if disabled(env):
-        raise UpdateError("updates are switched off (SSW_NO_UPDATE)")
+        raise UpdateError(SWITCHED_OFF)
     try:
         data = json.loads(get(env.get("SSW_UPDATE_URL") or RELEASE_URL))
     except UpdateError:
@@ -401,6 +403,8 @@ class UpdateFlow:
         self.env = env
         self.release = None             # a newer release that is known but not installed yet
         self.next_check = 0.0
+        self.failures = 0               # failed checks in a row: sets how soon the next look is
+        self._last_failure = None       # the message of the last failure, so a broken network logs one line, not thousands
         self.forced = False             # the user asked ("Update now" / "Check now"): install even with auto off
         self.stamp = file_stamp(self.exe) if self.frozen else None      # the program file as it was when we started
         self._seen = (None, None)       # (stamp, version) of the last changed file looked at
@@ -413,13 +417,31 @@ class UpdateFlow:
         return self.clock() >= self.next_check
 
     def check(self):
-        """Look now. -> the newer Release or None. Silent on failure apart from one log line."""
-        self.next_check = self.clock() + CHECK_EVERY
+        """Look now. -> the newer Release or None. Silent on failure apart from one log line per distinct message.
+        After a failure the next look comes sooner (2, 5, 15, then every 60 minutes) so a PC that woke up before its
+        network did does not wait six hours; after any answer it is the normal six hours again. Never raises."""
+        now = self.clock()
+        self.next_check = now + CHECK_EVERY
         try:
             rel = self.check_fn(env=self.env)
         except UpdateError as e:
-            self.log(f"update check: {e}")
+            msg = str(e)
+            if msg != SWITCHED_OFF:                     # switched off is not a failure: nothing to retry sooner
+                self.next_check = now + RETRY_AFTER_FAILURE[min(self.failures, len(RETRY_AFTER_FAILURE) - 1)]
+                self.failures += 1
+            if msg != self._last_failure:
+                self.log(f"update check: {msg}")
+            self._last_failure = msg
             return None
+        except Exception as e:                          # nothing unexpected may end checking: log it and look again
+            msg = f"unexpected {type(e).__name__}: {e}"[:200]
+            self.next_check = now + RETRY_AFTER_FAILURE[min(self.failures, len(RETRY_AFTER_FAILURE) - 1)]
+            self.failures += 1
+            if msg != self._last_failure:
+                self.log(f"update check: {msg}")
+            self._last_failure = msg
+            return None
+        self.failures, self._last_failure = 0, None
         if rel and (self.release is None or rel.version != self.release.version):
             self.log(f"update available: {rel.version}")
         self.release = rel
