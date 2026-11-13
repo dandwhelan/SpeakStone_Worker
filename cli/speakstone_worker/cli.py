@@ -411,7 +411,34 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
 
 
 # ---------------------------------------------------------------- settings
-def settings_menu(console, install, st):
+def update_now(flow, working=False):
+    """Settings [9]: look for a newer version now and install it. -> the sentence to show. Does not return when the
+    program was replaced (it restarts as the new version). With a worker making lines in this window nothing is cut
+    short: the board installs the update after the job in hand."""
+    if flow is None or update.disabled():
+        return "Updates are switched off on this PC."
+    said, keep = [], flow.log
+    flow.log = lambda text: (said.append(text), keep(text))[0]
+    try:
+        flow.next_check = 0.0
+        rel = flow.check()
+    finally:
+        flow.log = keep
+    if rel is None:
+        problem = next((t for t in said if t.startswith("update check:")), None)
+        if problem:
+            return "Could not look for updates: " + problem[len("update check:"):].strip() + "."
+        return f"You have the latest version ({__version__})."
+    ok, why = flow.can_apply()
+    if not ok:
+        return f"Version {rel.version} is available ({why}). Download it from the releases page."
+    if working:
+        flow.forced = True
+        return f"Version {rel.version} is available. Open the board: it installs after the job in hand."
+    return flow.apply()                         # does not return when it worked
+
+
+def settings_menu(console, install, st, flow=None, working=lambda: False):
     ask_site_for_label(install, force=True)          # a rename on the site shows at once
     while True:
         fresh_screen(console)
@@ -426,10 +453,15 @@ def settings_menu(console, install, st):
         console.print(f"  [{board.GOLD}][7][/] Update automatically: [bold]{'on' if st['auto_update'] else 'off'}[/]")
         console.print(f"  [{board.GOLD}][8][/] Start making lines when the app opens: "
                       f"[bold]{'on' if st['start_on_open'] else 'off'}[/]")
+        console.print(f"  [{board.GOLD}][9][/] Update now (this is version [bold]{__version__}[/])")
         console.print(f"  [{board.GOLD}][B][/] Back")
         with KeyReader() as keys:
             k = keys.wait()
-        if k == "8":
+        if k == "9":
+            console.print("Looking for a newer version...")
+            console.print(update_now(flow, working()))
+            time.sleep(3)
+        elif k == "8":
             st["start_on_open"] = not st["start_on_open"]
         elif k == "7":
             st["auto_update"] = not st["auto_update"]
@@ -1193,7 +1225,8 @@ def main(argv=None):
                                   "or the task was refused).")
                 time.sleep(2)
             elif choice == "3":
-                if settings_menu(console, install, st) == "exit":
+                if settings_menu(console, install, st, flow,
+                                 lambda: keep["runner"] is not None and keep["runner"].running) == "exit":
                     return 0
             elif choice in ("q", "\x1b"):
                 return 0
