@@ -96,6 +96,13 @@ LIVE_KEYS = ("gpu_util", "gpu_mem_used_mib", "vram_free_mib", "session_started_a
 
 EXIT_OK, EXIT_CONFIG, EXIT_KEY, EXIT_PROTOCOL, EXIT_MODEL = 0, 2, 3, 4, 5
 EXIT_BUSY = 6                           # another worker holds this config's lock (one worker per key on a PC)
+EXIT_BROKEN = 7                         # job after job, not one line could be made: stop instead of burning the queue
+# A PC whose engine or audio tool is broken fails every line of every job within seconds. Without a brake it claimed
+# the next job at once: 152 failed attempts across 17 jobs in 15 minutes on a rented Linux box (2026-11-13), and the
+# hub gave 14 groups up. After a job with NOT ONE line made the worker waits; after this many in a row it stops.
+DEAD_JOBS_LIMIT = 2
+DEAD_JOB_WAIT_SECONDS = 120
+BROKEN_FILE = "CANNOT_MAKE_LINES"       # the last error, for the app to show
 BUSY_MESSAGE = "Another SpeakStone Worker is already running with this key on this PC"
 MAX_REFS_PER_JOB = 40                    # 8 until 1.2.8; a chunk mixes many voices and 8 closed most jobs under 20 lines
 UPDATE_FILE = "UPDATE_REQUIRED"          # written when the site says this version is too old for new work: the app updates now
@@ -407,11 +414,28 @@ def rmtree_retry(path):
 NULL_GPU = {"name": None, "vram_total_mib": None, "vram_free_mib": None, "gpu_mem_used_mib": None, "gpu_util": None}
 
 
+def gpu_index(env=None):
+    """Which graphics card this worker uses on a PC with several: SSW_GPU=<number as nvidia-smi lists them>, or None
+    (the first card, as before). One worker drives one card, so a four-card machine runs four workers, each with its
+    own number, key and work folder. Anything that is not a small whole number is ignored."""
+    env = os.environ if env is None else env
+    v = str(env.get("SSW_GPU") or "").strip()
+    return int(v) if v.isdigit() and int(v) < 64 else None
+
+
+def smi(query, env=None):
+    """The nvidia-smi command for `query`, limited to this worker's own card when SSW_GPU names one. Without that, a
+    worker on the second card read the FIRST card's free memory and waited for ever while its own card sat idle."""
+    cmd = ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"]
+    i = gpu_index(env)
+    return cmd if i is None else cmd + ["-i", str(i)]
+
+
 def query_gpu():
     """The only place nvidia-smi is called. Degrades to nulls when it is missing or unreadable."""
     try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,memory.free,memory.used,utilization.gpu",
-                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=15)
+        r = subprocess.run(smi("name,memory.total,memory.free,memory.used,utilization.gpu"),
+                           capture_output=True, text=True, timeout=15)
         if r.returncode != 0 or not r.stdout.strip():
             return dict(NULL_GPU)
         parts = [p.strip() for p in r.stdout.strip().splitlines()[0].split(",")]
@@ -466,8 +490,7 @@ def read_telemetry(now=None, runner=subprocess.run, ttl=TELEMETRY_TTL):
     if _telemetry_cache["t"] is not None and now - _telemetry_cache["t"] < ttl:
         return _telemetry_cache["v"]
     try:
-        r = runner(["nvidia-smi", f"--query-gpu={_TELEMETRY_QUERY}", "--format=csv,noheader,nounits"],
-                   capture_output=True, text=True, timeout=5)
+        r = runner(smi(_TELEMETRY_QUERY), capture_output=True, text=True, timeout=5)
         v = parse_telemetry(r.stdout) if r.returncode == 0 else None
     except Exception:
         v = None
@@ -1816,6 +1839,19 @@ class Worker:
                 raise
             if f.reason == "gpu_fatal":
                 after_wait = GPU_FATAL_WAIT_SECONDS
+            if getattr(f, "none_made", False):
+                self._dead_jobs = getattr(self, "_dead_jobs", 0) + 1
+                if self._dead_jobs >= DEAD_JOBS_LIMIT:
+                    self.log.event("stop", None, reason="cannot make lines", code=EXIT_BROKEN, error=f.message)
+                    try:
+                        (self.work / BROKEN_FILE).write_text(f.message, encoding="utf-8")
+                    except OSError:
+                        pass
+                    self.engine_shutdown("broken")
+                    raise ExitRun(EXIT_BROKEN, "not one line could be made, two jobs in a row")
+                after_wait = max(after_wait or 0, DEAD_JOB_WAIT_SECONDS)
+            else:
+                self._dead_jobs = 0
         finally:
             hb.stop()
             self._current = None
@@ -1891,7 +1927,9 @@ class Worker:
             msg = f"{len(missing)} of {ctx.n} lines were not made"
             if last_err:
                 msg += f"; last error: {last_err}"
-            raise JobFail("line_failed", msg[:200], True, False)
+            fail = JobFail("line_failed", msg[:200], True, False)
+            fail.none_made = len(missing) == ctx.n
+            raise fail
 
         ctx.start_grace()      # every line is made: only a lost lease (or the grace running out) stops the delivery
         for upload_round in range(3):
@@ -1919,6 +1957,11 @@ class Worker:
         # (0 when the kept engine was reused; not known in one-process-per-job mode, where it is inside gen_s)
         load_s = round(ctx.load_s, 1) if self.engine_keep() else None
         gen_s = round(max(0.0, ctx.synth_s - (ctx.load_s if self.engine_keep() else 0.0)), 1)
+        self._dead_jobs = 0
+        try:
+            (self.work / BROKEN_FILE).unlink()
+        except OSError:
+            pass
         self.log.event("complete", ctx.job_id, ok=ok_n, held=held_n, seconds=round(time.time() - t_run, 1),
                        already=data.get("already"), words=job_words, audio=round(job_audio), load_s=load_s,
                        gen_s=gen_s)
@@ -1974,6 +2017,8 @@ class Worker:
         env = dict(os.environ)
         env["INDEXTTS2_DIR"] = str(self.cfg.model_dir)
         env["PYTHONUNBUFFERED"] = "1"
+        if gpu_index(env) is not None:              # the engine sees only this worker's card (as its device 0)
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_index(env))
         # some cloud images turn hf_transfer on without installing it, which crashes
         # IndexTTS-2's first-load model fetch on every run. Plain downloads work everywhere.
         env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"

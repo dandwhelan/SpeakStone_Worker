@@ -86,6 +86,11 @@ class SetupError(Exception):
     pass
 
 
+
+def _clean_env():
+    from . import paths
+    return paths.clean_child_env()
+
 @dataclass
 class Env:
     install: Path
@@ -95,7 +100,7 @@ class Env:
     enroll: callable = None                             # () -> {"key","label","worker_id","tier"}
     gpu_total_mib: callable = None                      # () -> int | None
     progress: callable = field(default=lambda step, frac, msg: None)
-    base_env: dict = field(default_factory=lambda: dict(os.environ))
+    base_env: dict = field(default_factory=lambda: _clean_env())   # Linux: without the app's private libraries
     is_win: bool = field(default_factory=lambda: sys.platform == "win32")
     api_base: str = ""                                  # only passed to the worker when it is not the default
     machine_name: str = ""
@@ -205,7 +210,8 @@ def real_probe(cmd, timeout):
     """Run a short command and hand back (exit code, its output). Never hangs: a timeout is a failure (-1)."""
     kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
     try:
-        r = subprocess.run([str(c) for c in cmd], stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, **kw)
+        r = subprocess.run([str(c) for c in cmd], stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                           env=_clean_env(), **kw)
     except (OSError, subprocess.SubprocessError):
         return -1, ""
     return r.returncode, (r.stdout or b"").decode("utf-8", "replace")

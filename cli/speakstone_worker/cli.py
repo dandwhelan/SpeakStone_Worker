@@ -364,6 +364,8 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
                 view["watching"] = watching
                 if state == "stopped" and _group_exit_code(runner) == 6:
                     view["stop_note"] = BUSY_SENTENCE
+                if state == "stopped" and _group_exit_code(runner) == 7:
+                    view["stop_note"] = BROKEN_SENTENCE
                 view["paused_until"] = control_mod.until_label(paused_until) if paused and paused_until else None
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
                 resized = console.size != last_size
@@ -602,13 +604,15 @@ def hide_console():
 
 
 # Exit codes the worker uses when restarting cannot help (key refused and the like): wait long, then try once more.
-NO_RESTART_CODES = (3, 4, 5, 6)
+NO_RESTART_CODES = (3, 4, 5, 6, 7)
 NO_RESTART_WAIT = 30 * 60
 CRASH_BACKOFF_FIRST = 30
 CRASH_BACKOFF_MAX = 10 * 60
 
 
 BUSY_SENTENCE = "Another SpeakStone Worker is already running with this key on this PC."
+BROKEN_SENTENCE = ("Stopped: this PC could not make a single line, two jobs in a row. Nothing more is taken from the "
+                   "queue. Open the log folder for the reason, then start again.")
 
 
 class RestartGate:

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from . import locking
+from . import paths
 
 
 # ---------------------------------------------------------------- tie the worker's life to ours
@@ -227,7 +228,7 @@ class WorkerRunner:
                 "--config", str(self.config_path)]
 
     def environment(self, base=None):
-        e = dict(base if base is not None else os.environ)
+        e = paths.clean_child_env(base)     # Linux: never hand the app's private libraries to the worker and ffmpeg
         e["PATH"] = str(self.install / "ffmpeg") + os.pathsep + e.get("PATH", "")
         e["INDEXTTS2_PYTHON"] = str(self.python)
         e["INDEXTTS2_DIR"] = str(self.install / "IndexTTS-2")
