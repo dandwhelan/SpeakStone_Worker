@@ -43,7 +43,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.2.11"
+WORKER_VERSION = "1.2.12"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
