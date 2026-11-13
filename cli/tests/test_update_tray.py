@@ -25,7 +25,7 @@ def release_json(tag="v1.3.0", names=("SpeakStoneWorker-windows.exe", "SpeakSton
 
 # ------------------------------------------------------------------ version and asset choice
 def test_version_is_shown_and_bumped():
-    assert __version__ == "1.2.7"
+    assert __version__ == "1.2.8"
     assert f"{APP_NAME} {__version__}" in board.menu_screen().plain
     assert cli.window_title() == f"{APP_NAME} {__version__}"
     assert "Update now" in board.menu_screen(False, "1.3.0").plain

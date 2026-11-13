@@ -358,3 +358,13 @@ def test_task_xml_restarts_after_a_crash_in_schema_order():
     r = settings.find(ns + "RestartOnFailure")
     assert r.find(ns + "Interval").text == "PT1M" and r.find(ns + "Count").text == "3"
     assert settings.find(ns + "ExecutionTimeLimit").text == "PT0S"
+
+
+# ------------------------------------------------------------------ 8. one version number
+def test_worker_version_matches_the_app_version():
+    """net_worker.py's WORKER_VERSION (sent to the site, read by setup and the board) must never drift from the app's."""
+    import re
+    from speakstone_worker import __version__
+    m = re.search(r'^WORKER_VERSION\s*=\s*"([^"]+)"', (ROOT_DIR / "net_worker.py").read_text(encoding="utf-8"), re.M)
+    assert m and m.group(1) == __version__ == "1.2.8"
+    assert nw.WORKER_VERSION == __version__
