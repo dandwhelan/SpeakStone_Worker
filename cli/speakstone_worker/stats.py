@@ -1,5 +1,5 @@
 """Board data: the worker's own log, one nvidia-smi reading, and the public queue figures.
-Ported from app/ssapp/stats.py and extended with what the live board shows (words, audio minutes, history, events)."""
+Also what the live board shows: words, audio minutes, history and events."""
 import json
 import re
 import subprocess

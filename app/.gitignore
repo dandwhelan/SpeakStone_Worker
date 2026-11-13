@@ -1,6 +1,0 @@
-.venv/
-build/
-dist/
-*.spec.bak
-dist_cli/
-build_cli/

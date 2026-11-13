@@ -1,4 +1,4 @@
-"""When to run in the background. `decide` is pure (ported from app/ssapp/idle.py); the readers never raise.
+"""When to run in the background. `decide` is pure; the readers never raise.
 
 idle_seconds() returns None where the OS gives no idle time (Linux without xprintidle, e.g. a headless box): the
 background loop then treats the PC as "always on" and runs the worker at low priority (nice).
@@ -13,7 +13,7 @@ LEAVE_SECONDS = 15      # input younger than this counts as "the user is back"
 
 def decide(mode, running, idle_seconds, idle_minutes, fullscreen, on_battery, paused,
            block_fullscreen=True, block_on_battery=True):
-    """Return 'start', 'stop' or 'keep'. mode: 'off' | 'now' | 'idle' (see app/ssapp/idle.py)."""
+    """Return 'start', 'stop' or 'keep'. mode: 'off' | 'now' | 'idle'."""
     if mode == "off" or paused:
         return "stop" if running else "keep"
     blocked = (block_fullscreen and fullscreen) or (block_on_battery and on_battery)

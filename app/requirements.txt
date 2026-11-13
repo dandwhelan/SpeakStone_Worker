@@ -1,5 +1,0 @@
-pystray==0.19.5
-Pillow>=10
-rich>=13
-pyinstaller>=6.6
-pytest

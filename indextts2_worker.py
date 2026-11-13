@@ -15,10 +15,9 @@ Hugging Face cache: that cache wants Windows symlinks, which an ordinary account
 """
 import argparse
 import hashlib
-import os as _os
-_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")   # less fragmentation: matters on an 8 GB card
 import json
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")   # less fragmentation: matters on an 8 GB card
 import random
 import re
 import shutil
@@ -204,18 +203,6 @@ def recipe_fingerprint(row, revision, bitrate):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def prepare_reference(refs_dir, ref_clip, cache_dir):
-    """IndexTTS-2 reads a wav; the references are mostly Ogg. Convert once per clip (24 kHz mono) and reuse."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    out = cache_dir / (Path(ref_clip).stem + ".wav")
-    if not out.exists():
-        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(refs_dir / ref_clip), "-ac", "1", "-ar", "24000",
-                            str(out)], capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError(f"reference convert failed for {ref_clip}: {r.stderr[-300:]}")
-    return out
-
-
 def load_model(device):
     if not (MODEL_DIR / "config.yaml").exists():
         print(f"[FATAL] IndexTTS-2 weights not found in {MODEL_DIR} (set INDEXTTS2_DIR, or download "
@@ -259,10 +246,11 @@ def load_model(device):
     return tts
 
 
-def prepare_reference_cached(refs_dir, ref_clip, cache_dir):
-    """Serve mode: the converted wav outlives the job, so the next job with the same voice does not convert it again.
+def prepare_reference(refs_dir, ref_clip, cache_dir):
+    """IndexTTS-2 reads a wav and the references are mostly Ogg, so each clip is converted once (24 kHz mono) and
+    reused. In serve mode cache_dir outlives the job, so the next job with the same voice does not convert it again.
     The name carries the source file's size and modification time, so a changed source never reuses an old wav. The
-    wav is written under a temporary name first: a process killed mid-convert must not leave half a file in the cache."""
+    wav is written under a temporary name first, so a process killed mid-convert leaves no half file in the cache."""
     src = Path(refs_dir) / ref_clip
     st = src.stat()
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -279,6 +267,15 @@ def prepare_reference_cached(refs_dir, ref_clip, cache_dir):
             raise RuntimeError(f"reference convert failed for {ref_clip}: {r.stderr[-300:]}")
         os.replace(str(part), str(out))
     return out
+
+
+def seed_all(seed):
+    """Every RNG the engine may draw from, set right before a line (or a piece of a split line) is made."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def by_voice(pending):
@@ -440,49 +437,28 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                 ogg_path = tmp / f"t_{os.getpid()}_{i}.ogg"
                 t0 = time.time()
                 try:
-                    random.seed(seed)
-                    np.random.seed(seed)
-                    torch.manual_seed(seed)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(seed)
-                    if ref_cache is not None:
-                        ref = prepare_reference_cached(refs, row["canonical_reference_clip"], Path(ref_cache))
-                    else:
-                        ref = prepare_reference(refs, row["canonical_reference_clip"], tmp / "refs")
+                    seed_all(seed)
+                    ref = prepare_reference(refs, row["canonical_reference_clip"],
+                                            Path(ref_cache) if ref_cache is not None else tmp / "refs")
+                    # 2026-11-07: beams by emotion (beams_for); infer_v2 defaults to 3
+                    kw = dict(spk_audio_prompt=str(ref), output_path=None, verbose=False, num_beams=beams)
+                    if row.get("temperature") is not None:
+                        kw["temperature"] = float(row["temperature"])
+                    if row.get("repetition_penalty") is not None:
+                        kw["repetition_penalty"] = float(row["repetition_penalty"])
+                    if vec and any(vec):
+                        kw.update(emo_vector=vec, emo_alpha=EMO_ALPHA)
                     parts = split_long_text(text)
                     if len(parts) <= 1:
-                        kw = dict(spk_audio_prompt=str(ref), text=text, output_path=None, verbose=False)
-                        kw["num_beams"] = beams   # 2026-11-07: beams by emotion (beams_for); infer_v2 defaults to 3
-                        if row.get("temperature") is not None:
-                            kw["temperature"] = float(row["temperature"])
-                        if row.get("repetition_penalty") is not None:
-                            kw["repetition_penalty"] = float(row["repetition_penalty"])
-                        if vec and any(vec):
-                            kw.update(emo_vector=vec, emo_alpha=EMO_ALPHA)
-                        sr, w = tts.infer(**kw)
+                        sr, w = tts.infer(text=text, **kw)
                     else:
                         part_waves = []
-                        sr = None
                         for p_idx, part_text in enumerate(parts, start=1):
-                            p_seed = int(hashlib.sha1(f"{seed}|split|{p_idx}".encode("utf-8")).hexdigest(), 16) % 2_000_000_000
-                            random.seed(p_seed)
-                            np.random.seed(p_seed)
-                            torch.manual_seed(p_seed)
-                            if torch.cuda.is_available():
-                                torch.cuda.manual_seed_all(p_seed)
-                            kw = dict(spk_audio_prompt=str(ref), text=part_text, output_path=None, verbose=False,
-                                      num_beams=beams)
-                            if row.get("temperature") is not None:
-                                kw["temperature"] = float(row["temperature"])
-                            if row.get("repetition_penalty") is not None:
-                                kw["repetition_penalty"] = float(row["repetition_penalty"])
-                            if vec and any(vec):
-                                kw.update(emo_vector=vec, emo_alpha=EMO_ALPHA)
-                            p_sr, p_w = tts.infer(**kw)
-                            sr = p_sr
-                            p_arr = np.asarray(p_w).reshape(-1)
-                            part_waves.append(p_arr)
-                        w = np.concatenate(part_waves, axis=0) if part_waves else np.zeros(0, dtype=np.int16)
+                            seed_all(int(hashlib.sha1(f"{seed}|split|{p_idx}".encode("utf-8")).hexdigest(), 16)
+                                     % 2_000_000_000)
+                            sr, p_w = tts.infer(text=part_text, **kw)
+                            part_waves.append(np.asarray(p_w).reshape(-1))
+                        w = np.concatenate(part_waves, axis=0)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 except Exception as e:

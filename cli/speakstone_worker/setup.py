@@ -1,4 +1,4 @@
-"""First-run setup as small, resumable steps. Ported from app/ssapp/setup_steps.py, made cross-platform.
+"""First-run setup as small, resumable steps, for Windows and Linux.
 
 Every outside effect (download, run a program, enrol, read the GPU) is passed in through `Env`, so tests run the
 whole list with fakes. The worker key goes to `net_worker.py init` through SSW_WORKER_KEY in the child's
