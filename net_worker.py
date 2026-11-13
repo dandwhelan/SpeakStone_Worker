@@ -58,6 +58,12 @@ RETRY_AFTER_CAP = 300     # longest wait a 429 Retry-After can ask for
 # this long with no job, and always when local GPU work wants the card, so the memory is not held for ever.
 ENGINE_MAX_JOBS = 50
 ENGINE_IDLE_SECONDS = 300
+# A frozen engine keeps its job (the heartbeat keeps renewing the lease) for hours. No new clip, no new line of engine
+# output and no ready/done marker for this long and the engine is killed and the job goes back to the queue. Loading
+# the model before the first clip can take several minutes, so the clock starts at run start and this covers it.
+STALL_SECONDS = 900
+STALL_MIN_SECONDS = 120
+STALL_CHECK_SECONDS = 2     # how often the progress signature is looked at (a folder listing is cheap, not free)
 ENGINE_READY_MARKER = "[ENGINE-READY]"
 ENGINE_DONE_RE = re.compile(r"^\[JOB-DONE\] rc=(-?\d+)\s*$")
 UPLOAD_THREADS = 4
@@ -116,6 +122,13 @@ class LeaseLost(Exception):
     def __init__(self, status):
         super().__init__(f"lease lost (HTTP {status})")
         self.status = status
+
+
+class Stalled(Exception):
+    """The engine made no progress for STALL_SECONDS (raised from JobCtx.check while a run is being watched)."""
+    def __init__(self, seconds):
+        super().__init__(f"no progress for {seconds} s")
+        self.seconds = seconds
 
 
 class NetError(Exception):
@@ -268,6 +281,16 @@ def sha256_file(path):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def stall_seconds(env=None):
+    """SSW_STALL_SECONDS, never below STALL_MIN_SECONDS (a typo must not kill a healthy model load)."""
+    env = os.environ if env is None else env
+    try:
+        v = int(float(env.get("SSW_STALL_SECONDS") or STALL_SECONDS))
+    except (TypeError, ValueError):
+        v = STALL_SECONDS
+    return max(STALL_MIN_SECONDS, v)
 
 
 def kill_tree(proc):
@@ -970,6 +993,48 @@ class JobCtx:
         self.grace_until = None      # set once every line is made: from then on only a lost lease may abort
         self.load_s = 0.0            # engine start to ready, summed over this job's runs (0 when a loaded one was reused)
         self.synth_s = 0.0           # time spent in run_synth, summed over this job's runs
+        self.stall_limit = None      # seconds without progress that end a run; None = not watching (set by run_synth)
+        self.stall_extra = None      # () -> anything that changes when the engine does something (line counter)
+        self.clock = time.monotonic
+        self._sig = None
+        self._sig_at = self._progress_at = 0.0
+
+    def stall_begin(self, limit, extra=None):
+        """Start watching a run. The clock starts now: model loading counts as waiting, which the limit covers."""
+        self.stall_limit, self.stall_extra, self._sig = limit, extra, None
+        self._sig_at = 0.0
+        self._progress_at = self.clock()
+
+    def stall_end(self):
+        self.stall_limit = None
+
+    def progress_signature(self):
+        """Changes whenever a clip appears, the engine log grows or the engine's marker/line counter moves."""
+        try:
+            log_size = (self.dir / "worker.log").stat().st_size
+        except OSError:
+            log_size = 0
+        extra = None
+        if self.stall_extra is not None:
+            try:
+                extra = self.stall_extra()
+            except Exception:
+                pass
+        return (self.lines_done(), log_size, extra)
+
+    def stalled_for(self):
+        """Seconds since the last progress, or None when not watching or all is well. Looks at most every
+        STALL_CHECK_SECONDS."""
+        if self.stall_limit is None:
+            return None
+        now = self.clock()
+        if self._sig is None or now - self._sig_at >= STALL_CHECK_SECONDS:
+            self._sig_at = now
+            sig = self.progress_signature()
+            if sig != self._sig:
+                self._sig, self._progress_at = sig, now
+        idle = now - self._progress_at
+        return int(idle) if idle >= self.stall_limit else None
 
     def start_grace(self, seconds=None):
         """Every line is made: a stop or a yield now waits for the upload and complete (bounded), because throwing the
@@ -994,6 +1059,9 @@ class JobCtx:
             raise Stop()
         if self.worker is not None and self.worker.yield_busy():
             raise Yield()
+        idle = self.stalled_for()
+        if idle is not None:
+            raise Stalled(idle)
 
     def lines_done(self):
         seen = set()
@@ -1064,6 +1132,7 @@ class EngineHost:
         self.jobs = 0
         self.last_used = time.monotonic()
         self.spawned_at = None
+        self.lines_seen = 0          # every line the engine printed, markers included: the stall watchdog's pulse
         self._sink_lock = threading.Lock()
         self._sink = None
         self._ready = self._done = self._eof = None
@@ -1085,6 +1154,7 @@ class EngineHost:
         try:
             for raw in iter(proc.stdout.readline, b""):
                 text = raw.decode("utf-8", "replace").strip()
+                self.lines_seen += 1
                 if text == ENGINE_READY_MARKER:
                     ready.set()
                     continue
@@ -1816,9 +1886,17 @@ class Worker:
 
     def run_synth(self, ctx):
         """Make the job's lines. -> the engine's exit code for this run (0 = all made or held)."""
-        if self.engine_keep():
-            return self.run_synth_kept(ctx)
-        return self.run_synth_once(ctx)
+        keep = self.engine_keep()
+        ctx.stall_begin(stall_seconds(), (lambda: self.engine_host().lines_seen) if keep else None)
+        try:
+            return self.run_synth_kept(ctx) if keep else self.run_synth_once(ctx)
+        except Stalled as e:
+            # both run paths already killed the engine's whole process tree on the way out
+            self.log.event("stall", ctx.job_id, seconds=e.seconds)
+            self.engine_shutdown("stalled")
+            raise JobFail("stalled", f"the engine made no progress for {e.seconds} s and was stopped", True, False) from None
+        finally:
+            ctx.stall_end()
 
     def engine_request(self, ctx):
         """One serve-mode request. Absolute paths: the engine runs in the work folder, not in the job's folder."""
