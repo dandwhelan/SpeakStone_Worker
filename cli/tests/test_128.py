@@ -3,6 +3,8 @@ import sys
 import time
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -78,3 +80,32 @@ def test_marker_counter_counts_as_progress(tmp_path, monkeypatch):
     assert ctx.stalled_for() is None
     now[0] += 3
     assert ctx.stalled_for() is not None
+
+
+# ------------------------------------------------------------------ 2. no blocking error boxes
+@pytest.mark.parametrize("modname", ["net_worker", "indextts2_worker", "speakstone_worker.cli"])
+def test_error_boxes_are_switched_off_and_never_raise(monkeypatch, modname):
+    import ast
+    import ctypes
+    path = {"net_worker": ROOT_DIR / "net_worker.py", "indextts2_worker": ROOT_DIR / "indextts2_worker.py",
+            "speakstone_worker.cli": ROOT_DIR / "cli" / "speakstone_worker" / "cli.py"}[modname]
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    # the function exists in the file itself (the two engine files are standalone) and main starts by calling it
+    assert any(isinstance(n, ast.FunctionDef) and n.name == "no_error_boxes" for n in tree.body)
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    first = [n for n in main.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))][0]
+    assert isinstance(first.value, ast.Call) and first.value.func.id == "no_error_boxes"
+    # run the function from that file against a fake kernel32
+    ns = {"sys": sys}
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "no_error_boxes")
+    exec(compile(ast.Module([fn], []), str(path), "exec"), ns)
+    calls = []
+    fake = type("W", (), {"kernel32": type("K", (), {"SetErrorMode": staticmethod(lambda m: calls.append(m))})})
+    monkeypatch.setattr(ctypes, "windll", fake, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    ns["no_error_boxes"]()
+    assert calls == [0x8003]
+    monkeypatch.setattr(fake.kernel32, "SetErrorMode", staticmethod(lambda m: 1 / 0))
+    ns["no_error_boxes"]()                                              # an error is swallowed
+    monkeypatch.setattr(sys, "platform", "linux")
+    ns["no_error_boxes"]()                                              # and other systems do nothing

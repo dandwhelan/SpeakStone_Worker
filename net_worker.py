@@ -2125,7 +2125,21 @@ def cmd_init(args):
     return EXIT_OK
 
 
+def no_error_boxes():
+    """Windows only: a crashing program must not open a modal error box nobody is there to click (the job would sit
+    behind it for ever). Children inherit the setting. Never raises."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        pass
+
+
 def main(argv=None, env=None):
+    no_error_boxes()
     args = build_parser().parse_args(argv)
     if args.command == "init":
         return cmd_init(args)

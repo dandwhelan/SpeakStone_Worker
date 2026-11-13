@@ -581,7 +581,21 @@ def serve(device="cuda", ref_cache=None, stdin=None, load=None, runner=None):
     return 0
 
 
+def no_error_boxes():
+    """Windows only: a crashing program must not open a modal error box nobody is there to click (the job would sit
+    behind it for ever). Children inherit the setting. Never raises."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        pass
+
+
 def main():
+    no_error_boxes()
     ap = argparse.ArgumentParser(description="IndexTTS-2 worker")
     ap.add_argument("--batch-file")
     ap.add_argument("--output-dir")

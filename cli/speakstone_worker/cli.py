@@ -1023,7 +1023,21 @@ def auto_start_wanted(menu, start, st, install, is_set_up=None, read_key=None):
     return bool((is_set_up or setup.is_set_up)(install) and (read_key or identity.read_key)(install))
 
 
+def no_error_boxes():
+    """Windows only: a crashing program must not open a modal error box nobody is there to click (the job would sit
+    behind it for ever). Children inherit the setting. Never raises."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        pass
+
+
 def main(argv=None):
+    no_error_boxes()
     ap = argparse.ArgumentParser(prog="speakstone_worker", description=APP_NAME)
     ap.add_argument("--background", action="store_true", help="run when the PC is idle (used by the service)")
     ap.add_argument("--start", action="store_true", help="skip the menu and start now")
