@@ -22,6 +22,7 @@ from .runner import WorkerGroup, install_close_handlers
 from .settings import Settings, in_pause_window, parse_hhmm
 
 
+WAIT_LEAVE = 120                            # seconds the board waits for a worker on its way out (as stop_and_wait does)
 VT = {"on": True}                           # False when the console cannot do ANSI: no alternate screen then
 
 
@@ -342,11 +343,18 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
         runner.start()
     result = "menu"
     follow = {"looked": time.time()}
+    monitor = None
+    # Set when the worker should run again but the last one is still on its way out (it hands its job back first, which
+    # takes a few seconds). start() refuses while it runs, so the start waits here until it has gone.
+    want_start = False
     try:
+        monitor = stats.GpuMonitor()
         with KeyReader() as keys, Live(console=console, screen=VT["on"], auto_refresh=False) as live:
             last_gpu, gpu, last_draw, last_view, last_size = 0, None, 0, None, console.size
-            monitor = stats.GpuMonitor()
             while True:
+                if want_start and not paused and not runner.running:
+                    runner.start()
+                    want_start = False
                 if time.time() - last_gpu > 2:
                     gpu, last_gpu = monitor.read(), time.time()
                 state = "paused" if paused else ("stopped" if not runner.running and not watching else "idle")
@@ -366,10 +374,13 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
                 if not paused or not runner.running:
                     follow_installed_update(flow, runner, watching, follow)    # the service updated: follow it
                 if flow and not paused and not watching and not follow.get("draining"):
-                    update_step(flow, ctl, settings, runner)       # a swap restarts with --start and does not return
+                    # a swap restarts with --start and does not return; True here means it failed after the worker
+                    # had already left for it, so the worker starts again
+                    if update_step(flow, ctl, settings, runner):
+                        want_start = True
                 if paused and paused_until and time.time() >= paused_until:      # a timed pause ends by itself
                     paused, paused_until = False, None
-                    runner.start()
+                    want_start = True
                 if watching:
                     if k == "s":                                              # stop the OTHER worker through its STOP file
                         runner.stop_foreign()
@@ -389,7 +400,7 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
                 elif k == "p":
                     if paused:
                         paused, paused_until = False, None
-                        runner.start()
+                        want_start = True
                     else:
                         choosing = True                                       # next key picks how long
                 elif k in ("s", "m"):
@@ -401,8 +412,17 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
         if flow:
             flow.args = []                         # back at the menu: an update restarts to the menu
         col.close()
+        if monitor:
+            monitor.close()
         fresh_screen(console)                      # the board's screen is gone: land on a clean one
         if result == "menu":
+            if want_start and not paused:          # [M] stops nothing: the old worker is still leaving, then it starts again
+                console.print("Waiting for the old worker to hand its job back, then starting again...")
+                end = time.time() + WAIT_LEAVE
+                while runner.running and time.time() < end:
+                    time.sleep(0.5)
+                if not runner.running:
+                    runner.start()
             keep["runner"] = runner                # [M] stops nothing: the worker keeps making lines behind the menu
         elif runner.running:
             console.print("Giving the current job back before stopping...")

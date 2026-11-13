@@ -370,9 +370,12 @@ def step_gpu(env):
 def step_folders(env):
     for d in (env.install, env.tools, env.work_dir):
         d.mkdir(parents=True, exist_ok=True)
+    # About 20 GB for a first install. Once the model is in place only the smaller pieces can be missing (the extra
+    # voice files are about 2 GB, a lost Python with torch about 6 GB), so a repair run on a fuller drive still goes.
+    need = 8 if model_complete(env.model_dir) else 20
     free = shutil.disk_usage(env.install).free
-    if free < 20 * 1024 ** 3:
-        raise SetupError(f"Only {free // 1024 ** 3} GB free on that drive; about 20 GB is needed.")
+    if free < need * 1024 ** 3:
+        raise SetupError(f"Only {free // 1024 ** 3} GB free on that drive; about {need} GB is needed.")
 
 
 def step_worker_files(env):
@@ -532,8 +535,9 @@ def step_model(env):
             if model_complete(env.model_dir):
                 return
     # The text-emotion folder (qwen*, about 1.2 GB) is never loaded by the worker, so it is not fetched.
+    # !r quotes the path safely: a user folder with an apostrophe (C:\Users\O'Brien) broke the old r'...' form
     code = (f"from huggingface_hub import snapshot_download; "
-            f"snapshot_download('{MODEL_REPO}', local_dir=r'{env.model_dir}', ignore_patterns=['qwen*/*', 'qwen*'])")
+            f"snapshot_download({MODEL_REPO!r}, local_dir={str(env.model_dir)!r}, ignore_patterns=['qwen*/*', 'qwen*'])")
     _run(env, "model", [env.py, "-c", code], extra_env=HF_FAST_ENV)
 
 

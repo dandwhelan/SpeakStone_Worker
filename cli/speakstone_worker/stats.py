@@ -51,16 +51,36 @@ def _flt(v):
         return 0.0
 
 
-def read_events(log_dir, since=None, max_files=3):
+_PARSED = {}            # log file path -> ((size, mtime_ns), parsed events); a file is parsed again only when it changes
+
+
+def _parse_file(f):
+    st = f.stat()
+    stamp = (st.st_size, st.st_mtime_ns)
+    hit = _PARSED.get(str(f))
+    if hit and hit[0] == stamp:
+        return hit[1]
     events = []
-    for f in sorted(Path(log_dir).glob("worker_*.log"))[-max_files:]:
+    with open(f, encoding="utf-8", errors="replace") as fh:
+        for ln in fh:
+            p = parse_line(ln)
+            if p:
+                p[2]["job"] = p[2].get("job", "-")
+                events.append(p)
+    _PARSED[str(f)] = (stamp, events)
+    return events
+
+
+def read_events(log_dir, since=None, max_files=3):
+    """Events from the newest `max_files` daily logs. The board asks every second; parsing three days of log each time
+    cost about 16 ms per day of log, so each file is parsed once and again only when its size or time changes."""
+    events = []
+    files = sorted(Path(log_dir).glob("worker_*.log"))
+    for f in files[:-max_files]:
+        _PARSED.pop(str(f), None)                       # an older day the board no longer reads
+    for f in files[-max_files:]:
         try:
-            with open(f, encoding="utf-8", errors="replace") as fh:
-                for ln in fh:
-                    p = parse_line(ln)
-                    if p and (since is None or p[0] >= since):
-                        p[2]["job"] = p[2].get("job", "-")
-                        events.append(p)
+            events += [p for p in _parse_file(f) if since is None or p[0] >= since]
         except OSError:
             pass
     return events
@@ -213,6 +233,7 @@ def merge_summaries(parts):
     out["first_today"] = min(firsts) if firsts else None
     out["events"] = sorted((e for p in parts for e in p["events"]), key=lambda e: -e[0])[:8]
     out["avg_job_seconds"] = sum(p["avg_job_seconds"] for p in parts) / len(parts)
+    out["dl_today"] = sum(p.get("dl_today", 0) for p in parts)          # the second worker's downloads count too
     making = [p for p in parts if p["making"]]
     out["making"] = bool(making)
     reasons = [p.get("idle_reason") for p in parts if not p["making"] and p.get("idle_reason")]
@@ -220,6 +241,7 @@ def merge_summaries(parts):
     if making:
         best = max(making, key=lambda p: p["job_started"])
         out["job"], out["job_lines"], out["job_started"] = best["job"], best["job_lines"], best["job_started"]
+        out["dl_job"] = best.get("dl_job", 0)
     return out
 
 
@@ -276,16 +298,24 @@ class GpuMonitor:
         self.util, self.d3 = [], []
         self.d3_ok = (sys.platform == "win32") if windows is None else windows
         self._last3d = 0.0
+        self._closed = threading.Event()
+        self._thread = None
         if self.d3_ok and start_thread:
-            threading.Thread(target=self._loop3d, daemon=True).start()
+            self._thread = threading.Thread(target=self._loop3d, daemon=True)
+            self._thread.start()
 
     def _loop3d(self):
-        while self.d3_ok:
+        while self.d3_ok and not self._closed.is_set():
             try:
                 self.sample3d()
             except Exception:                  # one bad reading must not end the thread; try again in 2 s
                 pass
-            time.sleep(2)
+            self._closed.wait(2)
+
+    def close(self):
+        """Stop the 3D sampling thread. The board makes a new monitor each time it opens, and without this every
+        visit left one more thread running typeperf for the life of the program."""
+        self._closed.set()
 
     def sample3d(self):
         v = self.d3_reader()

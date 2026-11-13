@@ -2,6 +2,8 @@
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
 
 from .paths import data_dir
@@ -41,10 +43,24 @@ class Settings:
             self.data.update({k: d[k] for k in DEFAULTS if k in d})
 
     def save(self):
+        """The background loop, its tray thread and a menu window can all save at once. Each writer gets its own temp
+        name (one shared `cli.tmp` let one writer move the other's file away), and on Windows the swap is tried again
+        for a moment while another process has the file open to read it."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_name(f"{self.path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        for attempt in range(10):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                time.sleep(0.05)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
 
     def __getitem__(self, k):
         return self.data[k]

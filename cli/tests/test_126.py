@@ -297,6 +297,9 @@ class FakeGpu:
     def read(self):
         return None
 
+    def close(self):
+        pass
+
 
 def board_env(monkeypatch, keys):
     BoardRunner.made = []

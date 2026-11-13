@@ -129,7 +129,10 @@ class Tray:
                 pass
 
     def start(self):
-        self.icon.run_detached()
+        # icon.run in a thread of its own. run_detached() does exactly this on Windows and Xorg, but on Linux's GTK and
+        # AppIndicator backends it only prepares the icon and expects the program to run a GLib main loop, which this
+        # program never does, so the icon never answered there. pystray's FAQ gives a thread as the way to do it.
+        threading.Thread(target=self.icon.run, daemon=True, name="tray").start()
         threading.Thread(target=self._poll, daemon=True).start()
         self.refresh()
 

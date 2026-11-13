@@ -3,7 +3,6 @@ from rich import box
 from rich.console import Group
 from rich.layout import Layout
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 from . import APP_NAME, TAGLINE, __version__
