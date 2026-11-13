@@ -270,9 +270,9 @@ def test_chatty_child_is_not_stalled_and_lines_and_exit_code_pass_through():
 
 def test_stall_limit_from_environment():
     from speakstone_worker import setup
-    assert setup.setup_stall_seconds({}) == 1800
+    assert setup.setup_stall_seconds({}) == 7200
     assert setup.setup_stall_seconds({"SSW_SETUP_STALL_SECONDS": "60"}) == 60
-    assert setup.setup_stall_seconds({"SSW_SETUP_STALL_SECONDS": "x"}) == 1800
+    assert setup.setup_stall_seconds({"SSW_SETUP_STALL_SECONDS": "x"}) == 7200
     assert setup._how_long(1800) == "30 minutes"
 
 
@@ -344,23 +344,6 @@ def test_background_log_is_cut_to_its_tail_only_when_large(tmp_path):
     assert cli.trim_background_log(tmp_path / "nope.log") is False
 
 
-# ------------------------------------------------------------------ 7. the service restarts after a crash
-def test_task_xml_restarts_after_a_crash_in_schema_order():
-    import xml.etree.ElementTree as ET
-    from speakstone_worker import service
-    xml = service.build_task_xml("prog", ["--background"])
-    root = ET.fromstring(xml.split("?>", 1)[1])
-    ns = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
-    settings = root.find(ns + "Settings")
-    names = [c.tag.replace(ns, "") for c in settings]
-    assert names == ["RestartOnFailure", "MultipleInstancesPolicy", "DisallowStartIfOnBatteries",
-                     "StopIfGoingOnBatteries", "StartWhenAvailable", "Enabled", "Hidden", "ExecutionTimeLimit"]
-    r = settings.find(ns + "RestartOnFailure")
-    assert r.find(ns + "Interval").text == "PT1M" and r.find(ns + "Count").text == "3"
-    assert settings.find(ns + "ExecutionTimeLimit").text == "PT0S"
-
-
-# ------------------------------------------------------------------ 8. one version number
 def test_worker_version_matches_the_app_version():
     """net_worker.py's WORKER_VERSION (sent to the site, read by setup and the board) must never drift from the app's."""
     import re

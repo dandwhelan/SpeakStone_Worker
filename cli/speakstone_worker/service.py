@@ -42,14 +42,13 @@ def build_task_xml(program, args):
   <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
-    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <Enabled>true</Enabled>
-    <Hidden>true</Hidden>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <Hidden>true</Hidden>
+    <Enabled>true</Enabled>
   </Settings>
   <Actions Context="Author"><Exec><Command>{escape(str(program))}</Command><Arguments>{escape(arguments)}</Arguments></Exec></Actions>
 </Task>

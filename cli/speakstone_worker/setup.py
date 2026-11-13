@@ -211,7 +211,7 @@ def real_probe(cmd, timeout):
     return r.returncode, (r.stdout or b"").decode("utf-8", "replace")
 
 
-SETUP_STALL_SECONDS = 1800      # a step that prints nothing for this long is stuck (a download that never ends)
+SETUP_STALL_SECONDS = 7200      # a step that prints nothing for this long is stuck. Two hours: a big package on a slow line prints nothing while it downloads
 
 
 def setup_stall_seconds(env=None):
