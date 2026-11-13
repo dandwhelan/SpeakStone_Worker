@@ -43,7 +43,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.2.8"
+WORKER_VERSION = "1.2.9"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
@@ -95,6 +95,8 @@ LIVE_KEYS = ("gpu_util", "gpu_mem_used_mib", "vram_free_mib", "session_started_a
 EXIT_OK, EXIT_CONFIG, EXIT_KEY, EXIT_PROTOCOL, EXIT_MODEL = 0, 2, 3, 4, 5
 EXIT_BUSY = 6                           # another worker holds this config's lock (one worker per key on a PC)
 BUSY_MESSAGE = "Another SpeakStone Worker is already running with this key on this PC"
+MAX_REFS_PER_JOB = 40                    # 8 until 1.2.8; a chunk mixes many voices and 8 closed most jobs under 20 lines
+UPDATE_FILE = "UPDATE_REQUIRED"          # written when the site says this version is too old for new work: the app updates now
 DRAIN_FILE = "STOP_AFTER_JOB"           # finish the job in hand, claim no more, exit (see Worker.drain_requested)
 
 
@@ -958,7 +960,7 @@ def check_payload(p):
         if not isinstance(br, str) or not BITRATE_RE.match(br):
             return "bad_job", "settings.bitrate is invalid"
         refs, lines = p.get("refs"), p.get("lines")
-        if not isinstance(refs, list) or not 1 <= len(refs) <= 8 or not isinstance(lines, list) or not lines:
+        if not isinstance(refs, list) or not 1 <= len(refs) <= MAX_REFS_PER_JOB or not isinstance(lines, list) or not lines:
             return "bad_job", "refs/lines missing"
         known = set()
         for r in refs:
@@ -1711,6 +1713,11 @@ class Worker:
             wait = idle_wait(base)
             if getattr(self, "engine", None) is not None and self.engine.needs_recycle():
                 self.engine_shutdown("idle" if self.engine.jobs < self.engine.max_jobs else "max_jobs")
+            if reason == "update_required":     # the site keeps new work from this version: tell the app to update now
+                try:
+                    (self.work / UPDATE_FILE).write_text(WORKER_VERSION, encoding="utf-8")
+                except OSError:
+                    pass
             self.log.event("idle", None, reason=reason, wait=wait)
             self.sleep(wait)
             return
@@ -2201,8 +2208,36 @@ def no_error_boxes():
         pass
 
 
+def trust_bundled_certificates(ssl_module=None, where=None):
+    """Windows hands Python only the certificates it already has in its store, and fetches missing ones lazily for
+    browsers but not for us: on some PCs every other connection to the release page failed with "unable to get issuer
+    certificate", so the program could not update (seen 2026-11-13). Every HTTPS connection this process makes now
+    trusts the system store AND the certificate list shipped with the program. Nothing is trusted less than before.
+    -> True when the list was added. Never raises."""
+    try:
+        import ssl as _ssl
+        ssl_module = ssl_module or _ssl
+        if where is None:
+            import certifi
+            where = certifi.where()
+        make = ssl_module.create_default_context
+
+        def context(*a, **kw):
+            ctx = make(*a, **kw)
+            try:
+                ctx.load_verify_locations(cafile=where)
+            except Exception:
+                pass
+            return ctx
+        ssl_module._create_default_https_context = context
+        return True
+    except Exception:
+        return False
+
+
 def main(argv=None, env=None):
     no_error_boxes()
+    trust_bundled_certificates()
     args = build_parser().parse_args(argv)
     if args.command == "init":
         return cmd_init(args)

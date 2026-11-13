@@ -111,6 +111,9 @@ def summarize(events, now, avg_job_seconds_default=60.0):
         elif ev == "fail":
             out["making"] = False
             out["events"].append((ts, "retry", f"job {job[:8]} - given back", kv.get("reason", "")))
+        elif ev == "idle" and kv.get("reason") == "update_required":
+            if not any(e[1] == "update" for e in out["events"][-3:]):
+                out["events"].append((ts, "update", "this version is too old for new work", "it updates itself"))
         elif ev == "lease_lost":
             out["making"] = False
             out["events"].append((ts, "dropped", f"job {job[:8]}", "the queue gave it to someone else"))

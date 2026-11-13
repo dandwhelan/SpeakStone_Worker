@@ -801,6 +801,27 @@ def follow_installed_update(flow, runner, watching, state, clock=time.time, ever
 DRAIN_LIMIT = 30 * 60           # how long an update waits for the job in hand before giving up for this round
 
 
+UPDATE_FILE = "UPDATE_REQUIRED"          # the worker writes it when the site says this version is too old (net_worker.py)
+
+
+def take_update_request(runner):
+    """Did a worker leave an UPDATE_REQUIRED note (the site gives this version no work)? The note is removed.
+    Never raises; a runner without work folders (tests, nothing started) answers False."""
+    found = False
+    for r in (getattr(runner, "runners", None) or [runner]):
+        work = getattr(r, "work_dir", None)
+        if not work:
+            continue
+        try:
+            note = Path(work) / UPDATE_FILE
+            if note.exists():
+                note.unlink()
+                found = True
+        except OSError:
+            pass
+    return found
+
+
 def update_step(flow, control, st, runner, clock=time.time, drain_limit=DRAIN_LIMIT, allow=True):
     """Update work for the background loop and the live board. Look every 6 hours (or when asked). When one may be
     installed: (1) download and prove the new file first, (2) ask a running worker to finish its job and leave, no
@@ -809,7 +830,11 @@ def update_step(flow, control, st, runner, clock=time.time, drain_limit=DRAIN_LI
     Returns True when a swap was tried."""
     if update.disabled():
         return False
-    if control.take_check():
+    asked = control.take_check()
+    if take_update_request(runner):                # the site will give this version no work: look for the update now
+        flow.log("the queue needs a newer version of this program; looking for the update now")
+        asked = True
+    if asked:
         flow.forced = True
         flow.next_check = 0.0
     if flow.due():
@@ -1072,8 +1097,36 @@ def no_error_boxes():
         pass
 
 
+def trust_bundled_certificates(ssl_module=None, where=None):
+    """Windows hands Python only the certificates it already has in its store, and fetches missing ones lazily for
+    browsers but not for us: on some PCs every other connection to the release page failed with "unable to get issuer
+    certificate", so the program could not update (seen 2026-11-13). Every HTTPS connection this process makes now
+    trusts the system store AND the certificate list shipped with the program. Nothing is trusted less than before.
+    -> True when the list was added. Never raises."""
+    try:
+        import ssl as _ssl
+        ssl_module = ssl_module or _ssl
+        if where is None:
+            import certifi
+            where = certifi.where()
+        make = ssl_module.create_default_context
+
+        def context(*a, **kw):
+            ctx = make(*a, **kw)
+            try:
+                ctx.load_verify_locations(cafile=where)
+            except Exception:
+                pass
+            return ctx
+        ssl_module._create_default_https_context = context
+        return True
+    except Exception:
+        return False
+
+
 def main(argv=None):
     no_error_boxes()
+    trust_bundled_certificates()
     ap = argparse.ArgumentParser(prog="speakstone_worker", description=APP_NAME)
     ap.add_argument("--background", action="store_true", help="run when the PC is idle (used by the service)")
     ap.add_argument("--start", action="store_true", help="skip the menu and start now")

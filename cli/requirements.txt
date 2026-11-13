@@ -1,3 +1,4 @@
 rich>=13
+certifi
 pystray>=0.19
 Pillow>=10

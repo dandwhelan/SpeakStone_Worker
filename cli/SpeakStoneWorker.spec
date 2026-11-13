@@ -5,7 +5,7 @@ from pathlib import Path
 root = Path(SPECPATH).parent
 assets = Path(SPECPATH) / 'speakstone_worker' / 'assets'
 # the tray library picks its backend at run time, so the backend modules are named here
-hidden = ['pystray._win32'] if sys.platform == 'win32' else ['pystray._xorg']
+hidden = (['pystray._win32'] if sys.platform == 'win32' else ['pystray._xorg']) + ['certifi']   # its hook bundles the certificate list
 a = Analysis(['run_cli.py'], pathex=[SPECPATH],
              datas=[(str(root / n), 'worker') for n in ('net_worker.py', 'indextts2_worker.py', 'runpod_worker.py')]
                    + [(str(assets / n), 'assets') for n in ('icon.png', 'icon.ico')],
