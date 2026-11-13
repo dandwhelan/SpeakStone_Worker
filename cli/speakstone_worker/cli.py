@@ -338,6 +338,7 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
     if not old and not watching and not reuse and not paused:
         runner.start()
     result = "menu"
+    follow = {"looked": time.time()}
     try:
         with KeyReader() as keys, Live(console=console, screen=VT["on"], auto_refresh=False) as live:
             last_gpu, gpu, last_draw, last_view, last_size = 0, None, 0, None, console.size
@@ -359,7 +360,9 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
                     live.update(board.render_board(view), refresh=True)
                     last_draw, last_view, last_size = time.time(), view, console.size
                 k = keys.poll(1.0)
-                if flow and not paused and not watching:
+                if not paused or not runner.running:
+                    follow_installed_update(flow, runner, watching, follow)    # the service updated: follow it
+                if flow and not paused and not watching and not follow.get("draining"):
                     update_step(flow, ctl, settings, runner)       # a swap restarts with --start and does not return
                 if paused and paused_until and time.time() >= paused_until:      # a timed pause ends by itself
                     paused, paused_until = False, None
@@ -740,6 +743,24 @@ def _setting(st, key, default=None):
 def interactive_command():
     """[program, args] that opens the normal menu: the exe itself, or `python -m speakstone_worker` from source."""
     return [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "speakstone_worker"]
+
+
+def follow_installed_update(flow, runner, watching, state, clock=time.time, every=15):
+    """Board and menu: when another copy of the program (the service) has already installed a newer version, this
+    window restarts as it. Our own worker first finishes the job in hand; a worker that belongs to the service is
+    left alone. `state` is a dict kept by the caller. Does not return when it restarted."""
+    if not flow or update.disabled() or clock() - state.get("looked", 0) < every:
+        return False
+    state["looked"] = clock()
+    if not flow.replaced():
+        return False
+    if runner is not None and runner.running and not watching:
+        if not state.get("draining"):
+            runner.request_drain()
+            state["draining"] = True
+            flow.log("a newer version is installed; restarting after the job in hand")
+        return False
+    return flow.restart_as_installed()
 
 
 DRAIN_LIMIT = 30 * 60           # how long an update waits for the job in hand before giving up for this round

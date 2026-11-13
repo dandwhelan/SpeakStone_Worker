@@ -247,6 +247,15 @@ def cleanup_old(exe):
         _remove(staging_name(exe))
 
 
+def file_stamp(path):
+    """(size, modified time) of a file, or None when it is not there."""
+    try:
+        st = os.stat(str(path))
+        return st.st_size, st.st_mtime_ns
+    except (OSError, TypeError):
+        return None
+
+
 def same_file(a, b):
     try:
         return os.path.normcase(os.path.realpath(str(a))) == os.path.normcase(os.path.realpath(str(b)))
@@ -393,6 +402,8 @@ class UpdateFlow:
         self.release = None             # a newer release that is known but not installed yet
         self.next_check = 0.0
         self.forced = False             # the user asked ("Update now" / "Check now"): install even with auto off
+        self.stamp = file_stamp(self.exe) if self.frozen else None      # the program file as it was when we started
+        self._seen = (None, None)       # (stamp, version) of the last changed file looked at
 
     @property
     def version(self):
@@ -416,6 +427,34 @@ class UpdateFlow:
 
     def can_apply(self):
         return can_self_update(self.frozen, self.exe, self.app_exe)
+
+    def replaced(self, stamp=file_stamp, version_of=run_version):
+        """Has ANOTHER copy of the program (the service, another window) already put a newer version in our place?
+        -> its version, or None. A window left open while the service updated itself kept running the old version for
+        ever, and its own later update attempt failed (seen 2026-11-13). The slow look inside the file (it has to be
+        started once) happens only when the file changed, and once per change."""
+        if not self.frozen or not self.exe or self.stamp is None:
+            return None
+        now = stamp(self.exe)
+        if now is None or now == self.stamp:
+            return None
+        if self._seen[0] != now:
+            text = version_of(self.exe)
+            found = text[len(APP_NAME):].strip() if text.startswith(APP_NAME + " ") else ""
+            self._seen = (now, found if found and is_newer(found, __version__) else None)
+        return self._seen[1]
+
+    def restart_as_installed(self, spawn=_spawn_detached, exit_fn=sys.exit):
+        """Start the program file that is already in place and leave. Nothing is downloaded or moved."""
+        self.log(f"restarting as the installed version {self._seen[1] or ''}".rstrip())
+        try:
+            spawn(relaunch_command(self.exe, self.args))
+        except OSError:
+            self.log("the installed newer version could not be started; close this window and open the program again")
+            self.stamp = self._seen[0]              # do not try again every few seconds
+            return False
+        exit_fn(0)
+        return True
 
     def prepare(self):
         """Download and prove the new file now, before anything is stopped. -> None, or a sentence on failure (the
