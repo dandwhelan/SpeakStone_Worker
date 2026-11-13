@@ -274,3 +274,71 @@ def test_stall_limit_from_environment():
     assert setup.setup_stall_seconds({"SSW_SETUP_STALL_SECONDS": "60"}) == 60
     assert setup.setup_stall_seconds({"SSW_SETUP_STALL_SECONDS": "x"}) == 1800
     assert setup._how_long(1800) == "30 minutes"
+
+
+
+# ------------------------------------------------------------------ 6. trimming
+def _age(path, days):
+    import os
+    t = time.time() - days * 86400
+    os.utime(path, (t, t))
+
+
+def test_old_worker_logs_are_deleted_and_recent_and_other_files_stay(tmp_path):
+    for name, days in (("worker_2020-01-01.log", 30), ("worker_old.log", 15), ("worker_new.log", 1),
+                       ("background.log", 90), ("notes.txt", 90)):
+        (tmp_path / name).write_text("x")
+        _age(tmp_path / name, days)
+    assert nw.prune_logs(tmp_path) == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["background.log", "notes.txt", "worker_new.log"]
+    assert nw.prune_logs(tmp_path / "missing") == 0                      # never raises
+
+
+def test_refs_over_the_limit_lose_the_least_recently_used_first(tmp_path):
+    import os
+    now = time.time()
+    for i, name in enumerate(["a", "b", "c", "d"]):
+        f = tmp_path / f"{name}.ogg"
+        f.write_bytes(b"x" * 100)
+        os.utime(f, (now - 1000 + i * 10, now - 1000 + i * 10))          # a oldest ... d newest
+    os.utime(tmp_path / "a.ogg", (now, now - 5000))                      # a was USED just now: access time wins
+    removed = nw.prune_refs(tmp_path, now=now, limit=350, target=250)
+    assert removed == 2 and sorted(p.name for p in tmp_path.iterdir()) == ["a.ogg", "d.ogg"]
+    assert nw.prune_refs(tmp_path, now=now, limit=350, target=250) == 0   # under the limit: nothing happens
+
+
+def test_refs_under_the_limit_are_untouched_and_old_part_files_go(tmp_path):
+    (tmp_path / "keep.ogg").write_bytes(b"x" * 100)
+    (tmp_path / "old.ogg.part").write_bytes(b"x")
+    (tmp_path / "fresh.ogg.part").write_bytes(b"x")
+    _age(tmp_path / "old.ogg.part", 2)
+    assert nw.prune_refs(tmp_path) == 1
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["fresh.ogg.part", "keep.ogg"]
+    assert nw.REFS_LIMIT_BYTES == 1024 ** 3 and nw.REFS_TARGET_BYTES == 800 * 1024 ** 2
+
+
+def test_worker_start_prunes_before_any_claim(tmp_path, monkeypatch):
+    called = []
+    monkeypatch.setattr(nw, "prune_logs", lambda d: called.append(("logs", Path(d).name)))
+    monkeypatch.setattr(nw, "prune_refs", lambda d: called.append(("refs", Path(d).name)))
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.yaml").write_text("x")
+    w, _ = make_worker(tmp_path, monkeypatch)
+    w.cfg.model_dir = str(tmp_path / "model")
+    monkeypatch.setattr(nw, "compute_model_hash", lambda *a, **k: "h")
+    monkeypatch.setattr(nw, "model_revision", lambda *a, **k: "r")
+    w.api = type("A", (), {"get_me": staticmethod(lambda: (200, {"worker": {}})), "post": staticmethod(lambda r, b: (200, {}))})()
+    w.startup()
+    assert called == [("logs", "logs"), ("refs", "refs")]
+
+
+def test_background_log_is_cut_to_its_tail_only_when_large(tmp_path):
+    from speakstone_worker import cli
+    log = tmp_path / "background.log"
+    lines = [f"2026-01-01 00:00:00 line {i:06d}\n" for i in range(60_000)]
+    log.write_text("".join(lines))
+    assert log.stat().st_size > cli.BACKGROUND_LOG_MAX and cli.trim_background_log(log) is True
+    data = log.read_text()
+    assert 150_000 < len(data) <= cli.BACKGROUND_LOG_KEEP and data.endswith(lines[-1]) and data.startswith("2026")
+    assert cli.trim_background_log(log) is False                         # small now: left alone
+    assert cli.trim_background_log(tmp_path / "nope.log") is False

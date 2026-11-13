@@ -606,6 +606,30 @@ def log_background_error(install, text):
         pass
 
 
+BACKGROUND_LOG_MAX = 1_000_000      # above this the service log is cut down once, when the service starts
+BACKGROUND_LOG_KEEP = 200_000
+
+
+def trim_background_log(path, max_bytes=BACKGROUND_LOG_MAX, keep=BACKGROUND_LOG_KEEP):
+    """background.log only ever grew. When it is over max_bytes keep just its last `keep` bytes (from a line start).
+    Rewritten in place once per service start, never while it is being appended to. Never raises."""
+    try:
+        path = Path(path)
+        if path.stat().st_size <= max_bytes:
+            return False
+        with open(path, "rb") as f:
+            f.seek(-keep, os.SEEK_END)
+            tail = f.read()
+        nl = tail.find(b"\n")
+        tail = tail[nl + 1:] if 0 <= nl < len(tail) - 1 else tail
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(tail)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
 def background_tick(runner, st, now=None, readers=None, gate=None, control=None):
     """One decision. Returns the action taken. Pure apart from starting/stopping the worker."""
     r = readers or {}
@@ -924,6 +948,7 @@ def job_running_now(install, workers=1, now=None):
 def background(install, st, flow=None, tray_start=tray_mod.start, making=job_running_now):
     """The service. Whatever ends it, one line in background.log says why (a hard kill cannot be logged)."""
     note = ExitNote(install)
+    trim_background_log(Path(install) / "work" / "logs" / "background.log")
     log_background_error(install, f"background {__version__} started")
     try:
         code = _background(install, st, note, flow, tray_start, making)

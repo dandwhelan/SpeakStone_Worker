@@ -283,6 +283,67 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+LOG_KEEP_DAYS = 14
+REFS_LIMIT_BYTES = 1024 ** 3        # the downloaded reference clips are a cache; over this size the oldest-used go
+REFS_TARGET_BYTES = 800 * 1024 ** 2
+PART_MAX_AGE = 86400                # a half-finished download older than this is never going to be finished
+
+
+def prune_logs(log_dir, now=None, days=LOG_KEEP_DAYS):
+    """Delete worker_*.log files not touched for `days` days. -> how many. Never raises."""
+    n = 0
+    try:
+        cutoff = (time.time() if now is None else now) - days * 86400
+        for e in os.scandir(log_dir):
+            try:
+                if e.is_file() and re.fullmatch(r"worker_.*\.log", e.name) and e.stat().st_mtime < cutoff:
+                    os.unlink(e.path)
+                    n += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return n
+
+
+def prune_refs(refs_dir, now=None, limit=REFS_LIMIT_BYTES, target=REFS_TARGET_BYTES):
+    """Trim the reference-clip cache: remove *.part files older than a day, and when the rest is over `limit` bytes
+    remove the least recently used (newest of access and modify time) until it is under `target`. Called only at
+    start, before any job is claimed, so no job in hand needs a file that goes (a missing one is fetched again anyway).
+    -> how many files were removed. Never raises."""
+    removed = 0
+    try:
+        now = time.time() if now is None else now
+        files = []
+        for e in os.scandir(refs_dir):
+            try:
+                if not e.is_file():
+                    continue
+                st = e.stat()
+                if e.name.endswith(".part"):
+                    if now - st.st_mtime > PART_MAX_AGE:
+                        os.unlink(e.path)
+                        removed += 1
+                    continue
+                files.append((max(st.st_atime, st.st_mtime), st.st_size, e.path))
+            except OSError:
+                pass
+        total = sum(f[1] for f in files)
+        if total > limit:
+            for _, size, path in sorted(files):
+                if total <= target:
+                    break
+                try:
+                    os.unlink(path)
+                    total -= size
+                    removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return removed
+
+
 def stall_seconds(env=None):
     """SSW_STALL_SECONDS, never below STALL_MIN_SECONDS (a typo must not kill a healthy model load)."""
     env = os.environ if env is None else env
@@ -1512,6 +1573,8 @@ class Worker:
         self.clear_drain()                      # a drain file left from an earlier run must not stop this one
         for d in (self.jobs_dir, self.refs_dir):
             d.mkdir(parents=True, exist_ok=True)
+        prune_logs(self.log.dir)                # housekeeping, only here: before any job is claimed
+        prune_refs(self.refs_dir)
         self.log.event("start", None, version=WORKER_VERSION, protocol=PROTOCOL, machine=self.cfg.machine_name,
                        key=mask_key(self.cfg.worker_key), api=self.cfg.api_base)
         self.model_hash = compute_model_hash(mdir, self.work / "model_hash.json")
