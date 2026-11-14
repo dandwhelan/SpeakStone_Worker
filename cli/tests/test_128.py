@@ -349,7 +349,7 @@ def test_worker_version_matches_the_app_version():
     import re
     from speakstone_worker import __version__
     m = re.search(r'^WORKER_VERSION\s*=\s*"([^"]+)"', (ROOT_DIR / "net_worker.py").read_text(encoding="utf-8"), re.M)
-    assert m and m.group(1) == __version__ == "1.2.16"
+    assert m and m.group(1) == __version__ == "1.2.17"
     assert nw.WORKER_VERSION == __version__
 
 

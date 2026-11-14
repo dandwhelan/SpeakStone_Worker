@@ -239,6 +239,10 @@ def run_setup_ui(console, install, base):
         except (setup.SetupError, enroll_mod.EnrollError) as e:
             redraw(error=str(e))
             return str(e)
+        except Exception as e:                   # anything else: a message and "run this again", never a traceback
+            text = f"something unexpected went wrong ({type(e).__name__}: {str(e)[:160]})"
+            redraw(error=text)
+            return text
         done.update(steps)
         redraw()
         time.sleep(2)

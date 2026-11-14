@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import sys
 import tarfile
 import threading
@@ -187,23 +188,71 @@ class Env:
 
 
 # ---------------------------------------------------------------- real effects
-def real_download(url, dest, progress=None):
+DOWNLOAD_TRIES = 6
+DOWNLOAD_WAITS = (2, 5, 15, 30, 60)       # seconds before tries 2..6
+
+
+def real_download(url, dest, progress=None, opener=None, sleep=time.sleep, tries=DOWNLOAD_TRIES):
+    """Fetch url to dest. A connection that drops part-way is tried again, carrying on from the bytes already saved
+    when the server allows it and from the start when it does not. Until 1.2.16 one dropped connection during setup
+    ended the whole program with a traceback (IncompleteRead, seen on a rented machine 2026-11-14: it then sat idle
+    for 45 minutes). When every try fails: SetupError, which setup shows as an ordinary message."""
+    import http.client
+    opener = opener or urllib.request.urlopen
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": "SpeakStoneWorkerCLI"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        got = 0
-        while True:
-            b = r.read(1 << 20)
-            if not b:
-                break
-            f.write(b)
-            got += len(b)
-            if progress:
-                progress(got / total if total else None, got, total)
-    os.replace(part, dest)
+    try:
+        part.unlink()                                # a .part from an older run may be a different file
+    except OSError:
+        pass
+    last = None
+    for attempt in range(max(1, tries)):
+        if attempt:
+            sleep(DOWNLOAD_WAITS[min(attempt - 1, len(DOWNLOAD_WAITS) - 1)])
+        try:
+            have = part.stat().st_size if part.exists() else 0
+        except OSError:
+            have = 0
+        headers = {"User-Agent": "SpeakStoneWorkerCLI"}
+        if have:
+            headers["Range"] = f"bytes={have}-"
+        try:
+            with opener(urllib.request.Request(url, headers=headers), timeout=60) as r:
+                resumed = bool(have) and getattr(r, "status", 200) == 206
+                if not resumed:
+                    have = 0                         # the server sent the whole file again
+                length = int(r.headers.get("Content-Length") or 0)
+                total = (have + length) if length else 0
+                got = have
+                with open(part, "ab" if resumed else "wb") as f:
+                    while True:
+                        b = r.read(1 << 20)
+                        if not b:
+                            break
+                        f.write(b)
+                        got += len(b)
+                        if progress:
+                            progress(got / total if total else None, got, total)
+            if total and got < total:
+                raise http.client.IncompleteRead(b"", total - got)
+            os.replace(part, dest)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 416:                        # our saved bytes are not a prefix of this file: start again
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+                last = e
+                continue
+            if e.code < 500 and e.code not in (408, 429):
+                raise SetupError(f"a download was refused (HTTP {e.code}); start setup again later") from None
+            last = e
+        except (OSError, http.client.HTTPException) as e:      # dropped, timed out, cut short
+            last = e
+    raise SetupError(f"a download kept dropping ({type(last).__name__}); check your connection and start setup "
+                     "again: it carries on from where it stopped") from None
 
 
 def real_probe(cmd, timeout):
