@@ -387,6 +387,8 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                     if dur <= 0.05 or osr != rw.OUTPUT_SAMPLE_RATE or och != rw.OUTPUT_CHANNELS:
                         raise ValueError(f"encoded audio failed validation (duration={dur}s, sr={osr}, channels={och})")
                     why = rw.qc_clip(dur, text)
+                    if not why and (level or {}).get("silent"):
+                        why = "silent clip (no sound to measure)"
                     if why:      # a loop, a runaway or a sliver: waits in _held_qc/ for a listen, next run uses the next seed
                         held_dir = out / rw.QC_HELD_DIR
                         held_dir.mkdir(exist_ok=True)

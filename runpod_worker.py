@@ -8,6 +8,7 @@ it after the move to IndexTTS-2, so it was removed. The file keeps its name beca
 """
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -191,6 +192,12 @@ def apply_post_fx_and_encode(in_wav, out_ogg, post_af=None, bitrate="32k", shout
             raise RuntimeError(f"FFmpeg pre-filter failed: {r.stderr[-500:]}")
         j = _loudnorm_measure(mid, [])
         filters = []
+        if j is not None and not math.isfinite(float(j["input_i"])):
+            # A clip with no sound in it measures as minus infinity. Until 1.2.18 that figure went into the record,
+            # made the worker's final message invalid JSON and the site refused the whole job (2026-11-14: one
+            # "Ugh..." line failed a 29-line job on three machines). The caller holds the clip; no figure is stored.
+            info["silent"] = True
+            j = None
         if j is not None:
             mi = float(j["input_i"])
             info["measured_lufs"] = round(mi, 2)

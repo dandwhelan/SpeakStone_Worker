@@ -22,6 +22,7 @@ import getpass
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import platform
 import queue
@@ -968,12 +969,24 @@ class Api:
     def post(self, route, body):
         body = dict(body)
         body["protocol"] = PROTOCOL
-        data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        data = json.dumps(_finite(body), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         h = {}
         s, b = http_request("POST", f"{self.base}/api/worker/{route}",
                             self._headers({"Content-Type": "application/json"}), data=data, timeout=self.timeout,
                             resp_headers=h)
         return self._finish(s, b, h)
+
+
+def _finite(v):
+    """v with every infinite or not-a-number figure replaced by None, so a message to the site is always valid JSON
+    (Python writes those as Infinity / NaN, which the site cannot read and answers with HTTP 400)."""
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, dict):
+        return {k: _finite(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_finite(x) for x in v]
+    return v
 
 
 def retry_after_seconds(headers, data, now=None):
