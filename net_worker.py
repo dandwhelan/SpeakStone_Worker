@@ -1842,11 +1842,15 @@ class Worker:
             self.log.event("error", None, where="claim", error="malformed job answer")
             self.sleep(self.backoff.next())
             return
-        jobdir = self.safe_job_dir(job_id)
-        jobdir.mkdir(parents=True, exist_ok=True)
         attempt = job.get("attempt")
-        atomic_write_json(jobdir / "state.json", {"job_id": job_id, "lease_id": lease_id, "attempt": attempt,
-                                                  "payload": payload})
+        try:
+            jobdir = self.safe_job_dir(job_id)
+            jobdir.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(jobdir / "state.json", {"job_id": job_id, "lease_id": lease_id, "attempt": attempt,
+                                                      "payload": payload})
+        except Exception as e:
+            self.setup_failed(job_id, lease_id, attempt, payload, e)
+            return
         ctx = JobCtx(job_id, lease_id, attempt, payload, jobdir)
         ctx.worker = self
         self._current = ctx
@@ -1879,32 +1883,68 @@ class Worker:
             self.engine_shutdown("exit")
             raise
         except JobFail as f:
-            try:
-                self.send_fail(ctx, f)
-            except Stop:
-                self.release(ctx)
-                raise
-            if f.reason == "gpu_fatal":
-                after_wait = GPU_FATAL_WAIT_SECONDS
-            if getattr(f, "none_made", False):
-                self._dead_jobs = getattr(self, "_dead_jobs", 0) + 1
-                if self._dead_jobs >= DEAD_JOBS_LIMIT:
-                    self.log.event("stop", None, reason="cannot make lines", code=EXIT_BROKEN, error=f.message)
-                    try:
-                        (self.work / BROKEN_FILE).write_text(f.message, encoding="utf-8")
-                    except OSError:
-                        pass
-                    self.engine_shutdown("broken")
-                    raise ExitRun(EXIT_BROKEN, "not one line could be made, two jobs in a row")
-                after_wait = max(after_wait or 0, DEAD_JOB_WAIT_SECONDS)
-            else:
-                self._dead_jobs = 0
+            after_wait = self.after_fail(ctx, f)
+        except Exception as e:
+            # Anything else used to escape: no fail was sent, the engine kept running and the job stayed leased with its
+            # folder kept for a resume, so a job that always crashed the worker came back for ever (2026-11-14 review).
+            # Only the type name is sent: never a traceback or a path.
+            kill_tree(ctx.proc)
+            self.log.event("error", job_id, where="job", error=type(e).__name__)
+            after_wait = self.after_fail(ctx, JobFail("worker_error", f"unexpected {type(e).__name__} in the worker",
+                                                      True, True))
         finally:
             hb.stop()
             self._current = None
         if after_wait:
             self.log.event("idle", None, reason="gpu_fatal", wait=after_wait)
             self.sleep(after_wait)
+
+    def after_fail(self, ctx, f):
+        """Send a job's failure to the site and apply the brake. -> seconds to wait before the next job."""
+        after_wait = 0
+        try:
+            self.send_fail(ctx, f)
+        except Stop:
+            self.release(ctx)
+            raise
+        if f.reason == "gpu_fatal":
+            after_wait = GPU_FATAL_WAIT_SECONDS
+        if getattr(f, "none_made", False):
+            self._dead_jobs = getattr(self, "_dead_jobs", 0) + 1
+            if self._dead_jobs >= DEAD_JOBS_LIMIT:
+                self.log.event("stop", None, reason="cannot make lines", code=EXIT_BROKEN, error=f.message)
+                try:
+                    (self.work / BROKEN_FILE).write_text(f.message, encoding="utf-8")
+                except OSError:
+                    pass
+                self.engine_shutdown("broken")
+                raise ExitRun(EXIT_BROKEN, "not one line could be made, two jobs in a row")
+            after_wait = max(after_wait or 0, DEAD_JOB_WAIT_SECONDS)
+        else:
+            self._dead_jobs = 0
+        return after_wait
+
+    def setup_failed(self, job_id, lease_id, attempt, payload, exc):
+        """The job folder could not be made or written (disk full, no permission) before the job even started. Give the
+        job back as a retryable failure so it does not sit leased for its whole lease, and carry on: this must not
+        crash the loop. One try only; a stop or exit still passes through."""
+        self.log.event("error", job_id, where="job_setup", error=type(exc).__name__)
+        ctx = JobCtx(job_id, lease_id, attempt, payload, self.jobs_dir / str(job_id))
+        ctx.worker = self
+        f = JobFail("worker_error", f"could not prepare the job folder ({type(exc).__name__})", True, True)
+        try:
+            self.log.event("fail", job_id, reason=f.reason, retryable=True, message=f.message)
+            self.post_job("fail", {"reason": f.reason, "message": safe_msg(f.message)[:500], "retryable": True}, ctx,
+                          retry=False)
+        except (Stop, ExitRun):
+            raise
+        except Exception as e:
+            self.log.event("fail", job_id, reason=f.reason, note=f"not delivered: {describe_exc(e)}")
+        try:
+            self.delete_job_dir(job_id)
+        except Exception:
+            pass
+        self.sleep(self.backoff.next())
 
     def release(self, ctx, message="worker stopped"):
         """Ctrl+C / STOP: give the job back (attempt refunded). One try only: the user wants out."""
