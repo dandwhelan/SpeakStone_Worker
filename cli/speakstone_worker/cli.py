@@ -1230,6 +1230,9 @@ def main(argv=None):
         return 0
     install, st = paths.data_dir(), Settings()
     if a.background:
+        if update.heal_spinning_host(["--background"]):      # started by an old version's restart: see update.py
+            log_background_error(install, "the hidden console host was using a whole processor core; restarted the service cleanly")
+            return 0
         return background(install, st)
     console = make_console()
     set_title(window_title())

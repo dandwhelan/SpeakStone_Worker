@@ -322,6 +322,98 @@ def _spawn_detached(cmd, popen=subprocess.Popen):
     return popen(cmd, start_new_session=True, **kw)
 
 
+HEALED_ENV = "SSW_HEALED"          # set on the process that replaces a service whose console host was spinning
+
+
+def _process_table():
+    """{pid: (parent pid, exe name)} for every process (Windows). Empty on any failure."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+    out = {}
+    try:
+        k = ctypes.windll.kernel32
+        k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        snap = k.CreateToolhelp32Snapshot(0x2, 0)
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return out
+        e = Entry()
+        e.dwSize = ctypes.sizeof(Entry)
+        ok = k.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(e))
+        while ok:
+            out[e.th32ProcessID] = (e.th32ParentProcessID, e.szExeFile.lower())
+            ok = k.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(e))
+        k.CloseHandle(ctypes.c_void_p(snap))
+    except Exception:
+        return {}
+    return out
+
+
+def _cpu_seconds(pid):
+    """Processor seconds a process has used so far (Windows), or None."""
+    import ctypes
+    try:
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = ctypes.c_void_p
+        h = k.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return None
+        c, e, kt, ut = (ctypes.c_ulonglong() for _ in range(4))
+        ok = k.GetProcessTimes(ctypes.c_void_p(h), ctypes.byref(c), ctypes.byref(e), ctypes.byref(kt), ctypes.byref(ut))
+        k.CloseHandle(ctypes.c_void_p(h))
+        return (kt.value + ut.value) / 1e7 if ok else None
+    except Exception:
+        return None
+
+
+def console_host_above(pid=None, table=None):
+    """pid of the conhost.exe this process was started through (looked for up to four levels up), or None."""
+    table = _process_table() if table is None else table
+    pid = os.getpid() if pid is None else pid
+    for _ in range(4):
+        parent, _name = table.get(pid, (None, ""))
+        if not parent or parent not in table:
+            return None
+        if table[parent][1] == "conhost.exe":
+            return parent
+        pid = parent
+    return None
+
+
+def heal_spinning_host(args, platform=None, frozen=None, env=None, host=console_host_above, cpu=_cpu_seconds,
+                       sleep=None, spawn=None, exe=None, seconds=1.5):
+    """Versions up to 1.2.12 restarted the background service after an update with the hidden console host reading
+    "nothing", which makes that host burn a whole processor core for as long as the service runs. The version that
+    fixes the restart is itself started by the OLD code, so it would inherit the problem until the next logon.
+    At the start of background mode: if the console host above us is using most of a core, start the service again
+    the right way and leave. -> True when it did (the caller must exit). Once only (HEALED_ENV), never raises."""
+    import time as _time
+    env = os.environ if env is None else env
+    try:
+        if (platform or sys.platform) != "win32" or env.get(HEALED_ENV):
+            return False
+        if not (getattr(sys, "frozen", False) if frozen is None else frozen):
+            return False
+        pid = host()
+        if not pid:
+            return False
+        a = cpu(pid)
+        (sleep or _time.sleep)(seconds)
+        b = cpu(pid)
+        if a is None or b is None or (b - a) < seconds * 0.5:
+            return False
+        env[HEALED_ENV] = "1"
+        (spawn or _spawn_detached)(relaunch_command(exe or sys.executable, list(args), "win32"))
+        return True
+    except Exception:
+        return False
+
+
 def swap_windows(exe, new, args, rename=os.rename, replace=os.replace, spawn=_spawn_detached, remove=_remove,
                  exit_fn=sys.exit):
     """A running exe can be renamed but not overwritten: move it to `.old`, put the new one in its place, start it,

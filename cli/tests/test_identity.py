@@ -98,10 +98,10 @@ def test_settings_line_and_other_places_show_the_label(tmp_path):
     with_key(tmp_path)
     cli.ask_site_for_label(tmp_path, opener=Opener(ME))
     assert cli.worker_label(tmp_path) == "Dusk Hollow" and identity.describe(tmp_path) == "Dusk Hollow (own)"
-    assert "SpeakStone Worker 1.2.13 - Dusk Hollow" in board.menu_screen(False, None, "Dusk Hollow").plain
-    m = tray.build_menu("1.2.13", "Working", False, {}, None, "Dusk Hollow")
-    assert m[0].label == "SpeakStone Worker 1.2.13 - Dusk Hollow"
-    assert tray.build_menu("1.2.13", "Working", False, {})[0].label == "SpeakStone Worker 1.2.13"
+    assert "SpeakStone Worker 1.2.14 - Dusk Hollow" in board.menu_screen(False, None, "Dusk Hollow").plain
+    m = tray.build_menu("1.2.14", "Working", False, {}, None, "Dusk Hollow")
+    assert m[0].label == "SpeakStone Worker 1.2.14 - Dusk Hollow"
+    assert tray.build_menu("1.2.14", "Working", False, {})[0].label == "SpeakStone Worker 1.2.14"
     state = cli.tray_state_reader(cli.control_mod.Control(), {"block_fullscreen": 1}, tmp_path)()
     assert state["label"] == "Dusk Hollow"
 
@@ -114,7 +114,7 @@ def test_board_shows_the_label(tmp_path):
          "label": "Dusk Hollow"}
     con = Console(width=120, height=40, record=True, file=open(os.devnull, "w", encoding="utf-8"))
     con.print(board.render_board(s))
-    assert "v1.2.13 - Dusk Hollow" in con.export_text()
+    assert "v1.2.14 - Dusk Hollow" in con.export_text()
 
 
 def test_the_key_is_never_in_what_is_shown(tmp_path):

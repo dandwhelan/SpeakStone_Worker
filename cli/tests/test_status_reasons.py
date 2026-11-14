@@ -1,4 +1,4 @@
-"""1.2.13: the board and the tray say WHY the worker is idle, and a yielding worker still tells the site it is alive.
+"""1.2.14: the board and the tray say WHY the worker is idle, and a yielding worker still tells the site it is alive.
 Real parsing of small fake worker logs in tmp_path; the site and the clock are fakes."""
 import sys
 import time
