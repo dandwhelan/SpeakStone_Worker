@@ -20,6 +20,7 @@ import argparse
 import email.utils
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -681,17 +682,59 @@ REF_MARGIN_BYTES = 1024               # a reference may overrun its declared siz
 UPLOAD_HEADERS = ("content-type", "content-length")
 
 
+_transfer_api = {"host": "", "loopback": False}
+
+
+def _host_is_local(host):
+    """True for localhost names and for IP literals that point at this machine or its own network."""
+    h = (host or "").strip("[]").lower().rstrip(".")
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h.split("%")[0])
+    except ValueError:
+        return False
+    return (ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified
+            or (ip.version == 6 and ip in ipaddress.ip_network("fc00::/7")))
+
+
+def _is_loopback(host):
+    h = (host or "").strip("[]").lower().rstrip(".")
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(h.split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def set_transfer_policy(api_base):
+    """Called once when a Worker starts. Why: a transfer link comes from the site, and a hostile site could point it at
+    the volunteer's own machine or network (2026-11-14 review). Until this is called the strict rule applies."""
+    host = urllib.parse.urlsplit(str(api_base or "")).hostname or ""
+    _transfer_api["host"] = host.lower()
+    _transfer_api["loopback"] = _is_loopback(host)
+
+
 def check_url(url):
-    """Only https:// URLs (loopback http:// for tests) may be opened. Any other scheme (file:, ftp:, data:, ...) is refused. -> url."""
+    """Only https:// URLs (loopback http:// when the site address itself is loopback, for tests) may be opened. Any
+    other scheme (file:, ftp:, data:, ...) is refused, and so is a link to this machine or its network unless the
+    site address is that same host. -> url."""
     try:
         parts = urllib.parse.urlsplit(url)
         host = parts.hostname or ""
     except (ValueError, AttributeError):
         raise NetError("refused: not a valid URL") from None
-    if parts.scheme == "https" and host:
+    if _transfer_api["loopback"] or host.lower() == _transfer_api["host"]:
+        local_ok = True
+    else:
+        local_ok = not _host_is_local(host)
+    if parts.scheme == "https" and host and local_ok:
         return url
-    if parts.scheme == "http" and host in LOOPBACK:
+    if parts.scheme == "http" and host in LOOPBACK and _transfer_api["loopback"]:
         return url
+    if parts.scheme in ("http", "https") and host and not local_ok:
+        raise NetError("refused: link points at this computer or its network")
     raise NetError(f"refused: URL scheme {parts.scheme[:12] or '?'!r} is not allowed")
 
 
@@ -1362,6 +1405,7 @@ class Worker:
     def __init__(self, cfg, log=None, gpu_query=query_gpu, skip_vram_wait=None, max_cycles=None,
                  install_signals=True):
         self.cfg = cfg
+        set_transfer_policy(cfg.api_base)
         self.work = cfg.work_dir
         self.jobs_dir = self.work / "jobs"
         self.refs_dir = self.work / "refs"
@@ -2150,7 +2194,7 @@ class Worker:
             for attempt in range(1, 4):
                 ok = False
                 try:
-                    s, _ = http_request(entry.get("method") or "PUT", entry["url"], headers=safe_upload_headers(entry.get("headers")),
+                    s, _ = http_request("PUT", entry["url"], headers=safe_upload_headers(entry.get("headers")),
                                         data=v["path"].read_bytes(), timeout=120)
                     ok = 200 <= s < 300
                     err = f"HTTP {s}"
