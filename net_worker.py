@@ -43,7 +43,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.2.12"
+WORKER_VERSION = "1.2.13"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
@@ -796,11 +796,14 @@ def _pid_alive(pid):
 
 def lock_held(path):
     """Another program's GPU lock: held if the file exists and its last token is a live PID, or it has
-    no PID and is younger than 3 h. Never created, held or deleted here."""
+    no PID and is younger than 3 h. A lock whose text contains the word no_gpu is not held: its owner is busy
+    with something that leaves the card alone (packing, uploading). Never created, held or deleted here."""
     try:
         p = Path(path)
         text, age = p.read_text(encoding="utf-8", errors="replace").split(), time.time() - p.stat().st_mtime
     except OSError:
+        return False
+    if "no_gpu" in text:                 # the holder says this stretch of its work does not use the card: carry on
         return False
     pid = text[-1] if text and text[-1].isdigit() else None
     return _pid_alive(pid) if pid else age < 3 * 3600

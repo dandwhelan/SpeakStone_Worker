@@ -25,7 +25,7 @@ def release_json(tag="v1.3.0", names=("SpeakStoneWorker-windows.exe", "SpeakSton
 
 # ------------------------------------------------------------------ version and asset choice
 def test_version_is_shown_and_bumped():
-    assert __version__ == "1.2.12"
+    assert __version__ == "1.2.13"
     assert f"{APP_NAME} {__version__}" in board.menu_screen().plain
     assert cli.window_title() == f"{APP_NAME} {__version__}"
     assert "Update now" in board.menu_screen(False, "1.3.0").plain
@@ -1150,6 +1150,8 @@ def test_a_restarted_menu_window_keeps_its_output(monkeypatch):
     update._spawn_detached(["conhost.exe", "--headless", "C:/x/SpeakStoneWorker.exe", "--background"],
                            popen=lambda cmd, **kw: calls.append(kw))
     assert calls[0]["stdout"] == subprocess.DEVNULL and calls[0]["creationflags"] & 0x08
+    # input must be a pipe, never the null device: the hidden console host spins a core on the null device
+    assert calls[0]["stdin"] == subprocess.PIPE
 
 
 def test_attach_console_repairs_output_sent_nowhere():

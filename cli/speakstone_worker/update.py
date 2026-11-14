@@ -302,7 +302,11 @@ def relaunch_command(exe, args, platform=None, environ=None):
 def _spawn_detached(cmd, popen=subprocess.Popen):
     env = dict(os.environ)
     env[RESET_ENV] = "1"
-    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Input is a pipe nobody writes to, NOT "nothing": the hidden console host (conhost --headless) reads its input in
+    # a tight loop when that input is the null device and burns a whole processor core for as long as the service
+    # runs. Every service restarted by an update did that until 1.2.12 (measured 2026-11-14: 85 to 92% of one core
+    # with the null device, 0% with a pipe, also after the pipe's other end has closed).
+    quiet = dict(stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     kw = dict(env=env, **quiet)
     if sys.platform == "win32":
         base = 0x00000008 | 0x00000200                      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
