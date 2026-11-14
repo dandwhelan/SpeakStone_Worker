@@ -127,6 +127,10 @@ class ExitRun(Exception):
         self.code = code
 
 
+class Drained(Exception):
+    """A "finish and leave" request arrived while the worker had nothing in hand: leave now."""
+
+
 class Yield(Exception):
     """Another program holds the GPU lock: give the job back and wait."""
 
@@ -1546,6 +1550,13 @@ class Worker:
         self.sleep_impl(seconds, ctx)
         if self._stop_now(ctx):
             raise Stop()
+        # A wait with nothing in hand ends at once when a drain is asked for (the pause, an update). It must also END
+        # THE LOOP it sits in. Until 1.2.16-rc2 it only returned, so a worker waiting for graphics memory, for another
+        # program's lock or for the network went round its loop about 20 times a second for as long as the request
+        # stood: a full processor core and a log growing by megabytes (seen 2026-11-14: a pause from the tray while a
+        # game held the card's memory).
+        if ctx is None and self.drain_requested():
+            raise Drained()
         if ctx is not None:
             ctx.check()
 
@@ -1775,13 +1786,17 @@ class Worker:
                 cycles += 1
                 try:
                     self.cycle()
-                except (Stop, ExitRun):
+                except (Stop, ExitRun, Drained):
                     raise
                 except Exception as e:
                     self.log.event("error", None, where="cycle", error=describe_exc(e))
                     self.sleep(self.backoff.next())
         except Stop:
             self.log.event("stop", None, reason="requested")
+            return EXIT_OK
+        except Drained:
+            self.clear_drain()
+            self.log.event("stop", None, reason="drained")
             return EXIT_OK
         except ExitRun as e:
             self.log.event("stop", None, reason=str(e) or "exit", code=e.code)
@@ -1890,6 +1905,8 @@ class Worker:
             raise
         except JobFail as f:
             after_wait = self.after_fail(ctx, f)
+        except Drained:
+            raise
         except Exception as e:
             # Anything else used to escape: no fail was sent, the engine kept running and the job stayed leased with its
             # folder kept for a resume, so a job that always crashed the worker came back for ever (2026-11-14 review).
