@@ -103,6 +103,12 @@ EXIT_BROKEN = 7                         # job after job, not one line could be m
 # hub gave 14 groups up. After a job with NOT ONE line made the worker waits; after this many in a row it stops.
 DEAD_JOBS_LIMIT = 2
 DEAD_JOB_WAIT_SECONDS = 120
+# The brake only counted jobs with not one line made, and any other failure reset it, so a PC whose engine stalled on
+# every job or whose uploads always failed failed a job every 15 minutes for ever (2026-11-14 review). Now ANY failed
+# job counts, except the user's own stop and a yield hand-back; only a completed job resets it. The wait after a failed
+# job doubles for each failure in the row (120, 240, 480 ... up to the cap), and this many in a row stop the worker.
+FAILED_JOBS_LIMIT = 5
+FAILED_JOB_WAIT_CAP_SECONDS = 1800
 BROKEN_FILE = "CANNOT_MAKE_LINES"       # the last error, for the app to show
 BUSY_MESSAGE = "Another SpeakStone Worker is already running with this key on this PC"
 MAX_REFS_PER_JOB = 40                    # 8 until 1.2.8; a chunk mixes many voices and 8 closed most jobs under 20 lines
@@ -1896,33 +1902,37 @@ class Worker:
             hb.stop()
             self._current = None
         if after_wait:
-            self.log.event("idle", None, reason="gpu_fatal", wait=after_wait)
+            self.log.event("idle", None, reason="failed_job", wait=after_wait)
             self.sleep(after_wait)
 
     def after_fail(self, ctx, f):
         """Send a job's failure to the site and apply the brake. -> seconds to wait before the next job."""
-        after_wait = 0
         try:
             self.send_fail(ctx, f)
         except Stop:
             self.release(ctx)
             raise
-        if f.reason == "gpu_fatal":
-            after_wait = GPU_FATAL_WAIT_SECONDS
-        if getattr(f, "none_made", False):
-            self._dead_jobs = getattr(self, "_dead_jobs", 0) + 1
-            if self._dead_jobs >= DEAD_JOBS_LIMIT:
-                self.log.event("stop", None, reason="cannot make lines", code=EXIT_BROKEN, error=f.message)
-                try:
-                    (self.work / BROKEN_FILE).write_text(f.message, encoding="utf-8")
-                except OSError:
-                    pass
-                self.engine_shutdown("broken")
-                raise ExitRun(EXIT_BROKEN, "not one line could be made, two jobs in a row")
-            after_wait = max(after_wait or 0, DEAD_JOB_WAIT_SECONDS)
-        else:
-            self._dead_jobs = 0
-        return after_wait
+        return self.brake(f)
+
+    def brake(self, f):
+        """Count a failed job and decide whether to wait or stop. -> seconds to wait before the next job. A failure that
+        is not this PC's fault or is the user's choice (reason "released") counts for nothing."""
+        if f.reason == "released":
+            return 0
+        self._failed_jobs = getattr(self, "_failed_jobs", 0) + 1
+        none_made = bool(getattr(f, "none_made", False))
+        self._dead_jobs = getattr(self, "_dead_jobs", 0) + 1 if none_made else 0
+        if self._dead_jobs >= DEAD_JOBS_LIMIT or self._failed_jobs >= FAILED_JOBS_LIMIT:
+            self.log.event("stop", None, reason="cannot make lines", code=EXIT_BROKEN, error=f.message)
+            try:
+                (self.work / BROKEN_FILE).write_text(f.message, encoding="utf-8")
+            except OSError:
+                pass
+            self.engine_shutdown("broken")
+            raise ExitRun(EXIT_BROKEN, "jobs keep failing on this PC: "
+                          + ("not one line could be made" if self._dead_jobs >= DEAD_JOBS_LIMIT else "too many in a row"))
+        wait = min(DEAD_JOB_WAIT_SECONDS * 2 ** (self._failed_jobs - 1), FAILED_JOB_WAIT_CAP_SECONDS)
+        return max(wait, GPU_FATAL_WAIT_SECONDS if f.reason == "gpu_fatal" else 0)
 
     def setup_failed(self, job_id, lease_id, attempt, payload, exc):
         """The job folder could not be made or written (disk full, no permission) before the job even started. Give the
@@ -1944,7 +1954,7 @@ class Worker:
             self.delete_job_dir(job_id)
         except Exception:
             pass
-        self.sleep(self.backoff.next())
+        self.sleep(max(self.brake(f), self.backoff.next()))
 
     def release(self, ctx, message="worker stopped"):
         """Ctrl+C / STOP: give the job back (attempt refunded). One try only: the user wants out."""
@@ -2045,6 +2055,7 @@ class Worker:
         load_s = round(ctx.load_s, 1) if self.engine_keep() else None
         gen_s = round(max(0.0, ctx.synth_s - (ctx.load_s if self.engine_keep() else 0.0)), 1)
         self._dead_jobs = 0
+        self._failed_jobs = 0
         try:
             (self.work / BROKEN_FILE).unlink()
         except OSError:
