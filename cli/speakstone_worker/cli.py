@@ -358,6 +358,10 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
                 if want_start and not paused and not runner.running:
                     runner.start()
                     want_start = False
+                if getattr(runner, "runners", None) and not paused and not watching and not want_start \
+                        and not follow.get("draining") and ctl.drain_reason is None:
+                    observe_gates(runner, gates)           # a worker that died while the other runs starts again
+                    revive_members(runner, gates, ctl)
                 if time.time() - last_gpu > 2:
                     gpu, last_gpu = monitor.read(), time.time()
                 state = "paused" if paused else ("stopped" if not runner.running and not watching else "idle")
@@ -767,6 +771,22 @@ def dead_members_to_start(runner, gate):
     return out
 
 
+def revive_members(runner, gate, control=None):
+    """B4: a group meant to be running but with one worker dead (the other still running) starts the dead one again
+    when its own gate allows. Until 2026-11-14 only "nothing runs" counted, so a crashed second worker stayed off for
+    as long as the first one ran. -> the workers started."""
+    if gate is None or not getattr(runner, "runners", None) or not runner.running or runner.stop_asked_at:
+        return []
+    if control is not None and (control.paused or control.drain_reason):
+        return []
+    todo = dead_members_to_start(runner, gate)
+    if todo:
+        runner.start(only=todo)
+        for r in todo:
+            _gate_of(gate, r).seen_running = True
+    return todo
+
+
 def _group_exit_code(runner):
     """First non-zero exit code among the workers that have ended, else 0 (None if there is nothing to read)."""
     rs = getattr(runner, "runners", None) or [runner]
@@ -878,6 +898,8 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
         if gate is not None:                   # a refused key exits within seconds, before the next tick sees it run
             for r in (to_start if to_start is not None else [runner]):
                 _gate_of(gate, r).seen_running = True
+    elif action == "keep" and revive_members(runner, gate, control):
+        action = "start"
     elif action == "stop":
         runner.request_stop()
     runner.poll_stop()
