@@ -314,6 +314,9 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
     setup.sync_worker_files(install, paths.resource_dir())
     runner = keep.get("runner")
     reuse = runner is not None and runner.running
+    gates = keep.setdefault("gates", RestartGates())
+    gates.release_all()
+    clear_latches(install=install)               # opening the board / pressing Start now is the person acting
     if not reuse:
         runner = WorkerGroup(install, settings["workers"])
     old = None if reuse else runner.find_existing()
@@ -364,7 +367,7 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
                 view["watching"] = watching
                 if state == "stopped" and _group_exit_code(runner) == 6:
                     view["stop_note"] = BUSY_SENTENCE
-                if state == "stopped" and _group_exit_code(runner) == 7:
+                if state == "stopped" and (_group_exit_code(runner) == LATCH_CODE or latched_now(runner, gates)):
                     view["stop_note"] = BROKEN_SENTENCE
                 view["paused_until"] = control_mod.until_label(paused_until) if paused and paused_until else None
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
@@ -606,6 +609,9 @@ def hide_console():
 # Exit codes the worker uses when restarting cannot help (key refused and the like): wait long, then try once more.
 NO_RESTART_CODES = (3, 4, 5, 6, 7)
 NO_RESTART_WAIT = 30 * 60
+BUSY_WAIT = 60                  # code 6: another window holds this key; it may close in seconds, so look again soon
+LATCH_CODE = 7                  # "cannot make lines": never retried by itself, only when the person acts
+LATCH_FILE = "CANNOT_MAKE_LINES"   # in the worker's work folder: the worker writes it on exit 7 and removes it after a job
 CRASH_BACKOFF_FIRST = 30
 CRASH_BACKOFF_MAX = 10 * 60
 
@@ -616,17 +622,41 @@ BROKEN_SENTENCE = ("Stopped: this PC could not make a single line, two jobs in a
 
 
 class RestartGate:
-    """Decides when a worker that exited may be started again, so a refused key is not retried every few seconds.
-    The worker's own exit code is the only input; `clock` is injected for tests."""
+    """Decides when ONE worker that exited may be started again, so a refused key is not retried every few seconds.
+    The worker's own exit code is the only input; `clock` is injected for tests. Exit 7 ("cannot make lines") is a
+    latch: until 2026-11-14 it was retried every 30 minutes by a fresh process that had forgotten the failure, so a
+    broken PC took (and failed) a job every half hour for ever. The latch is the file CANNOT_MAKE_LINES in the worker's
+    work folder, so it survives a service restart; only the person acting (start in the app, tray Resume, an installed
+    update) removes it. `work_dir` is that folder (None in tests that have none; the latch then lives in memory)."""
 
-    def __init__(self, clock=time.time):
+    def __init__(self, clock=time.time, work_dir=None):
         self.clock = clock
+        self.work_dir = work_dir
         self.until = 0.0
         self.crashes = 0
         self.seen_running = False
+        self._mem_latch = False
+
+    @property
+    def latch_path(self):
+        return Path(self.work_dir) / LATCH_FILE if self.work_dir else None
+
+    def latched(self):
+        p = self.latch_path
+        return self._mem_latch or bool(p and p.exists())
+
+    def release(self):
+        """The person acted: forget every failure."""
+        self._mem_latch, self.until, self.crashes = False, 0.0, 0
+        p = self.latch_path
+        try:
+            if p:
+                p.unlink()
+        except OSError:
+            pass
 
     def blocked(self):
-        return self.clock() < self.until
+        return self.latched() or self.clock() < self.until
 
     def observe(self, running, exit_code):
         """Call once per tick with whether the worker runs and, when it does not, how its process ended."""
@@ -639,11 +669,102 @@ class RestartGate:
         if exit_code in (None, 0):
             self.crashes = 0
             return
+        if exit_code == LATCH_CODE:
+            p = self.latch_path
+            try:
+                if not p:
+                    raise OSError("no folder")
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("exit 7", encoding="utf-8")
+            except OSError:
+                self._mem_latch = True
+            return
+        if exit_code == 6:
+            self.until = self.clock() + BUSY_WAIT
+            return
         if exit_code in NO_RESTART_CODES:
             self.until = self.clock() + NO_RESTART_WAIT
             return
         self.until = self.clock() + min(CRASH_BACKOFF_MAX, CRASH_BACKOFF_FIRST * 2 ** self.crashes)
         self.crashes += 1
+
+
+class RestartGates:
+    """One RestartGate per worker (by its index), so one worker's bad exit never blocks the healthy one."""
+
+    def __init__(self, clock=time.time):
+        self.clock = clock
+        self.by_index = {}
+
+    def of(self, r):
+        i = getattr(r, "index", 1)
+        if i not in self.by_index:
+            self.by_index[i] = RestartGate(self.clock, getattr(r, "work_dir", None))
+        return self.by_index[i]
+
+    def release_all(self):
+        for g in self.by_index.values():
+            g.release()
+
+
+def _gate_of(gate, r):
+    """`gate` is a RestartGates (one gate per worker) or, for a single fake runner in tests, one RestartGate."""
+    return gate.of(r) if hasattr(gate, "of") else gate
+
+
+def _all_members(runner):
+    return list(getattr(runner, "runners", None) or [runner])
+
+
+def _active_members(runner):
+    return list(getattr(runner, "active", None) or [runner])
+
+
+def clear_latches(runner=None, install=None):
+    """The person acted (start, Resume, an installed update): remove every CANNOT_MAKE_LINES file so the worker may
+    start again. Never raises."""
+    dirs = [getattr(r, "work_dir", None) for r in _all_members(runner)] if runner is not None else []
+    if install:
+        dirs += [Path(install) / "work", Path(install) / "work_2"]
+    for d in dirs:
+        try:
+            if d:
+                (Path(d) / LATCH_FILE).unlink()
+        except OSError:
+            pass
+
+
+def latched_now(runner, gate=None):
+    """True when an active worker is held back by exit 7 (a file or this process's own latch)."""
+    for r in _active_members(runner):
+        wd = getattr(r, "work_dir", None)
+        try:
+            if wd and (Path(wd) / LATCH_FILE).exists():
+                return True
+        except OSError:
+            pass
+        if gate is not None and hasattr(gate, "of") and gate.of(r).latched():
+            return True
+    return False
+
+
+def observe_gates(runner, gate):
+    """Feed each worker's own gate this tick. A stop we asked for (idle ended, pause) is not a crash, whatever code a
+    killed process leaves."""
+    for r in _all_members(runner):
+        _gate_of(gate, r).observe(r.running, 0 if r.stop_asked_at or r.running else _group_exit_code(r))
+
+
+def dead_members_to_start(runner, gate):
+    """Active workers of a group that are not running, whose own gate allows it and that no other program holds."""
+    if not getattr(runner, "runners", None):
+        return []
+    out = []
+    for r in runner.active:
+        busy = getattr(r, "busy_elsewhere", None)
+        if not r.running and not _gate_of(gate, r).blocked() and not (busy and busy()):
+            out.append(r)
+    return out
 
 
 def _group_exit_code(runner):
@@ -731,11 +852,16 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
         elif action == "keep" and not paused and not (st["block_fullscreen"] and fullscreen) \
                 and not (st["block_on_battery"] and battery):
             action = "start"
+    to_start = None
     if gate is not None:
-        # a stop we asked for (idle ended, pause) is not a crash, whatever code a killed process leaves
-        gate.observe(runner.running, 0 if runner.stop_asked_at or runner.running else _group_exit_code(runner))
-        if action == "start" and gate.blocked():
-            action = "wait"
+        observe_gates(runner, gate)
+        if action == "start":
+            if getattr(runner, "runners", None):
+                to_start = dead_members_to_start(runner, gate)
+                if not to_start:
+                    action = "wait"
+            elif _gate_of(gate, runner).blocked():
+                action = "wait"
     if action == "start":
         busy = getattr(runner, "busy_elsewhere", None)
         if busy is not None and busy():
@@ -743,11 +869,15 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
     if action == "start" and control is not None and control.drain_reason == "update":
         action = "wait"                        # the worker left so the update can go in: do not start another
     if action == "start":
-        runner.start()
+        if to_start is not None:
+            runner.start(only=to_start)
+        else:
+            runner.start()
         if control is not None:
             control.force_start_until = 0.0
-        if gate is not None:
-            gate.seen_running = True           # a refused key exits within seconds, before the next tick sees it run
+        if gate is not None:                   # a refused key exits within seconds, before the next tick sees it run
+            for r in (to_start if to_start is not None else [runner]):
+                _gate_of(gate, r).seen_running = True
     elif action == "stop":
         runner.request_stop()
     runner.poll_stop()
@@ -851,6 +981,7 @@ def follow_installed_update(flow, runner, watching, state, clock=time.time, ever
             state["draining"] = True
             flow.log("a newer version is installed; restarting after the job in hand")
         return False
+    clear_latches(runner)                       # a newer version is being installed: let the worker try again
     return flow.restart_as_installed()
 
 
@@ -945,6 +1076,7 @@ def update_step(flow, control, st, runner, clock=time.time, drain_limit=DRAIN_LI
     control.drain_reason = None
     control.status = control_mod.UPDATING
     flow.log(f"update {flow.version}: restarting as the new version")
+    clear_latches(runner)                       # the new version may fix what stopped the worker
     if was_working and flow.before_swap:
         flow.before_swap()                      # the restarted service starts a worker at once
     note = flow.apply()
@@ -983,6 +1115,7 @@ def make_tray_actions(install, control, st, flow, open_board=tray_mod.open_board
         st["paused_until"] = 0
         if install:
             clear_pause_flag(install)
+            clear_latches(install=install)       # also lets a worker that "could not make lines" start again
     acts = {k: pause_for(m) for k, _label, m in tray_mod.PAUSE_CHOICES}
     return {**acts, "resume": resume,
             "block_fullscreen": toggle("block_fullscreen"), "block_on_battery": toggle("block_on_battery"),
@@ -1119,7 +1252,7 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
         note.write()                             # now: the process may be ended within seconds
         runner.shutdown_fast()
     install_close_handlers(on_close)
-    gate = RestartGate()
+    gate = RestartGates()
     follow = {"looked": time.time()}
     tray = tray_start(__version__, tray_state_reader(control, st, install), make_tray_actions(install, control, st, flow),
                       paths.assets_dir() / "icon.png", log)
@@ -1150,7 +1283,8 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
                 control.status = control_mod.status_for(runner.running or foreign, making_now and (runner.running or foreign),
                                                         control.paused, drain=control.drain_reason,
                                                         until=control.paused_until, foreign=foreign, lines=lines_now,
-                                                        idle_reason=reason_now)
+                                                        idle_reason=reason_now,
+                                                        broken=BROKEN_SENTENCE if latched_now(runner, gate) else None)
             except Exception as e:                  # one odd tick must not end the service
                 log(f"tick failed: {type(e).__name__}: {e}")
             time.sleep(5)

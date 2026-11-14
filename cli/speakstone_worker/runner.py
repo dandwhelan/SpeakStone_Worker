@@ -390,8 +390,9 @@ class WorkerGroup:
         for r in self.runners:
             r.stop_asked_at = v
 
-    def start(self):
-        return any([r.start() for r in self.active])
+    def start(self, only=None):
+        """Start every active worker, or just those named in `only` (the restart rules decide per worker)."""
+        return any([r.start() for r in (self.active if only is None else only)])
 
     def request_stop(self):
         for r in self.runners:
