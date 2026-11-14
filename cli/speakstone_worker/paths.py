@@ -2,6 +2,9 @@
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
+
+LOOPBACK_HOSTS = ('localhost', '127.0.0.1', '::1')
 
 
 def is_windows():
@@ -27,7 +30,18 @@ def resource_dir():
 def api_base(env=None):
     from . import DEFAULT_API_BASE
     env = os.environ if env is None else env
-    return (env.get("SPEAKSTONE_API_BASE") or DEFAULT_API_BASE).rstrip("/")
+    want = (env.get("SPEAKSTONE_API_BASE") or "").strip()
+    if want:
+        try:
+            u = urlparse(want)
+            ok = u.scheme == "https" or (u.scheme == "http" and (u.hostname or "") in LOOPBACK_HOSTS)
+            if ok and u.hostname and not u.username and not u.password:
+                return want.rstrip("/")
+        except ValueError:
+            pass
+    # Anything else (plain http to a real host, an odd scheme, junk) would send the worker key in the clear or to a
+    # stranger, so it is ignored.
+    return DEFAULT_API_BASE.rstrip("/")
 
 
 APP_EXE_NAME = "SpeakStoneWorker.exe"

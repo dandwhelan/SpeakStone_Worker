@@ -6,9 +6,11 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
+import urllib.request  # noqa: F401  (kept: tests patch it)
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .net import open_url
 
 MAKING_EVENTS = {"claim", "resume", "run_start"}
 DONE_EVENTS = {"complete", "fail", "idle", "stop", "lease_lost"}
@@ -187,7 +189,7 @@ def gpu_total_mib(runner=subprocess.run):
     return g["mem_total_mib"] if g else None
 
 
-def fetch_queue(api_base, opener=urllib.request.urlopen, timeout=8):
+def fetch_queue(api_base, opener=open_url, timeout=8):
     """Public figures from /api/network/stats. None when unreachable."""
     try:
         with opener(api_base.rstrip("/") + "/api/network/stats", timeout=timeout) as r:
