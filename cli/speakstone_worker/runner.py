@@ -394,6 +394,21 @@ class WorkerGroup:
         """Start every active worker, or just those named in `only` (the restart rules decide per worker)."""
         return any([r.start() for r in (self.active if only is None else only)])
 
+    def set_count(self, count):
+        """The settings changed: 1 or 2 workers wanted. A running first worker is never touched. A second one that is no
+        longer wanted finishes the job in hand and leaves (the drain file); one that is wanted again after a drain was
+        asked is let be. Starting a newly wanted second worker is the background loop's job."""
+        new = 2 if count == 2 and self.runners[1].config_path.exists() else 1
+        if new == self.count:
+            return False
+        self.count = new
+        second = self.runners[1]
+        if new == 1:
+            second.request_drain()
+        else:
+            second.clear_drain()
+        return True
+
     def request_stop(self):
         for r in self.runners:
             r.request_stop()

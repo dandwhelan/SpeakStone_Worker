@@ -66,6 +66,9 @@ class Settings:
         return self.data[k]
 
     def __setitem__(self, k, v):
+        # Re-read first: this copy may be older than the file. The window and the tray each keep their own copy, and
+        # writing a stale one back undid a change the other had made a moment earlier. Only this key changes.
+        self.reload()
         self.data[k] = v
         self.save()
 

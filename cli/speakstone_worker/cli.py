@@ -908,6 +908,17 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
     return action
 
 
+def apply_worker_count(runner, st):
+    """The number of workers wanted changed in the app window or the tray: apply it to the running group at once. The
+    first worker is never restarted for it; a second that is no longer wanted finishes its job and leaves. Never raises."""
+    try:
+        want = int(st["workers"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    setter = getattr(runner, "set_count", None)
+    return bool(setter and setter(want))
+
+
 def _busy(runner):
     f = getattr(runner, "busy_elsewhere", None)
     return bool(f and f())
@@ -1285,6 +1296,7 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
                 reload = getattr(st, "reload", None)
                 if reload:
                     reload()
+                apply_worker_count(runner, st)
                 if time.time() >= next_label:         # the label for the tray: once a day, every 30 minutes while unknown
                     next_label = time.time() + (identity.REFRESH_SECONDS if worker_label(install) else identity.RETRY_SECONDS)
                     ask_site_for_label(install)
