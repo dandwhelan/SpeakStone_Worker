@@ -195,9 +195,26 @@ def free_old_name(exe, remove=None):
     raise OSError("too many old copies of the program are still running; close its other windows")
 
 
-def self_run(cmd, timeout=60):
-    env = dict(os.environ)
+def _child_env():
+    """The environment for a copy of this program that we start: on Linux without the packaged program's private
+    library path (see paths.clean_child_env), everywhere with the "unpack afresh" mark."""
+    from . import paths
+    env = paths.clean_child_env()
     env[RESET_ENV] = "1"
+    return env
+
+
+def make_runnable(path, chmod=os.chmod, platform=None):
+    """Linux: a downloaded file is not a program until it is marked executable. Until 1.2.14 nothing did that, so the
+    "does it start" proof failed with "permission denied" on every Linux PC and no Linux install ever updated itself
+    (seen 2026-11-14 on a rented machine: "the downloaded file did not start as the expected version")."""
+    if (platform or sys.platform) != "win32":
+        chmod(str(path), 0o755)
+
+
+def self_run(cmd, timeout=180):
+    # 180 s, not 60: the one-file program takes about 30 s to unpack and a virus scanner may read it first
+    env = _child_env()
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
 
 
@@ -220,6 +237,7 @@ def fetch_verified(release, exe, get=http_get, download=http_download, run=self_
         download(release.asset_url, str(new))
         if not new.exists() or new.stat().st_size < min_bytes:
             raise UpdateError("the downloaded file is too small")
+        make_runnable(new)
         if sha256_of(new) != want:
             raise UpdateError("the downloaded file does not match its fingerprint")
         if run_version(new, run) != f"{APP_NAME} {release.version}":
@@ -300,8 +318,7 @@ def relaunch_command(exe, args, platform=None, environ=None):
 
 
 def _spawn_detached(cmd, popen=subprocess.Popen):
-    env = dict(os.environ)
-    env[RESET_ENV] = "1"
+    env = _child_env()
     # Input is a pipe nobody writes to, NOT "nothing": the hidden console host (conhost --headless) reads its input in
     # a tight loop when that input is the null device and burns a whole processor core for as long as the service
     # runs. Every service restarted by an update did that until 1.2.12 (measured 2026-11-14: 85 to 92% of one core
@@ -434,7 +451,13 @@ def swap_windows(exe, new, args, rename=os.rename, replace=os.replace, spawn=_sp
 
 
 def swap_linux(exe, new, args, replace=os.replace, execv=os.execv):
+    env = _child_env()                       # the new program must not start with OUR private library path
+    for k in ("LD_LIBRARY_PATH", "LD_LIBRARY_PATH_ORIG"):
+        os.environ.pop(k, None)
+        if k in env:
+            os.environ[k] = env[k]
     os.environ[RESET_ENV] = "1"
+    make_runnable(new)
     replace(new, exe)
     execv(str(exe), [str(exe), *args])
 
