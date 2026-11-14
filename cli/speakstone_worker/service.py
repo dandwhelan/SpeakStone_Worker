@@ -39,13 +39,26 @@ def windowless(program, args, environ=None):
     return (root + r"\System32\conhost.exe", ["--headless", str(program), *args])
 
 
-def build_task_xml(program, args):
+def windows_user(env=None):
+    """The signed-in person as Windows names them (PC\\name), or "" when it cannot be told."""
+    env = os.environ if env is None else env
+    name = (env.get("USERNAME") or "").strip()
+    domain = (env.get("USERDOMAIN") or "").strip()
+    return f"{domain}\\{name}" if name and domain else name
+
+
+def build_task_xml(program, args, user=None):
+    # The start-up trigger names the person. Without a name it means "when ANYONE signs in", and Windows lets only an
+    # administrator create that: from a normal window the install was refused with "Access is denied" on a PC with
+    # no older entry at all (owner's PC, 2026-11-14; proven there with a throw-away entry, with and without the name).
+    user = windows_user() if user is None else user
+    who = f"<UserId>{escape(user)}</UserId>" if user else ""
     arguments = " ".join(f'"{a}"' if " " in a else a for a in args)
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>Makes voice lines for the SpeakStone queue when your PC is idle.</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
-  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Triggers><LogonTrigger><Enabled>true</Enabled>{who}</LogonTrigger></Triggers>
+  <Principals><Principal id="Author">{who}<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
@@ -136,9 +149,10 @@ class Installed(int):
         if self:
             return f"Installed. It starts when your PC has been idle for {idle_minutes} minutes."
         if self.denied:
-            return ("Windows would not let this program install the service: an older copy of it was installed from an "
-                    "administrator window. Open a terminal as administrator, run\n    " + ADMIN_REMOVE +
-                    "\nand then choose this again from a normal window.")
+            return ("Windows would not let this program install the service. If an older copy of it was installed "
+                    "from an administrator window, open a terminal as administrator, run\n    " + ADMIN_REMOVE +
+                    "\nand then choose this again from a normal window. (If that command says it cannot find the "
+                    "file, there is no older copy: please report this.)")
         return ("Could not install the service (the program could not be copied into its own folder, "
                 "or the task was refused).")
 
