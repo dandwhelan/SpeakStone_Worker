@@ -157,7 +157,9 @@ def render_board(s):
         if s.get("job_lines", 0) == 0 and (g or {}).get("util_pct", 0) < 10:
             now.append(" - Getting ready: first job loads the voice engine (a minute or two)", style=PARCH)
         else:
-            now.append(f" - {s.get('job_lines', 0)} lines ", style=PARCH)
+            done = s.get("job_done")
+            count = f"{done} of {s.get('job_lines', 0)}" if done is not None else f"{s.get('job_lines', 0)}"
+            now.append(f" - {count} lines ", style=PARCH)
             now.append("[", style=DIM)
             now.append_text(bar(s.get("job_pct", 0.0), 19))
             now.append(f"] {round(s.get('job_pct', 0.0) * 100)}%", style=DIM)

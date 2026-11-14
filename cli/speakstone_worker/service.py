@@ -103,6 +103,46 @@ def _ok(runner, cmd):
         return False
 
 
+def _run_text(runner, cmd):
+    """-> (worked, what the command printed). Never raises."""
+    try:
+        r = runner(cmd, capture_output=True, text=True)
+    except OSError as e:
+        return False, str(e)
+    return r.returncode == 0, f"{getattr(r, 'stdout', '') or ''}\n{getattr(r, 'stderr', '') or ''}"
+
+
+def access_denied(text):
+    """Did Windows refuse for lack of rights? The task then belongs to an administrator: it was created from an
+    administrator window, and an ordinary window may read and run it but not replace or delete it."""
+    t = (text or "").lower()
+    return "access is denied" in t or "zugriff verweigert" in t or "accès refusé" in t or "acceso denegado" in t
+
+
+ADMIN_REMOVE = 'schtasks /Delete /TN "SpeakStone Worker" /F'
+
+
+class Installed(int):
+    """Truthy when the service was installed. `.denied`: Windows refused because an older service entry belongs to an
+    administrator (see access_denied)."""
+    denied = False
+
+    def __new__(cls, ok, denied=False):
+        self = super().__new__(cls, 1 if ok else 0)
+        self.denied = bool(denied)
+        return self
+
+    def sentence(self, idle_minutes):
+        if self:
+            return f"Installed. It starts when your PC has been idle for {idle_minutes} minutes."
+        if self.denied:
+            return ("Windows would not let this program install the service: an older copy of it was installed from an "
+                    "administrator window. Open a terminal as administrator, run\n    " + ADMIN_REMOVE +
+                    "\nand then choose this again from a normal window.")
+        return ("Could not install the service (the program could not be copied into its own folder, "
+                "or the task was refused).")
+
+
 def own_copy(frozen=None, executable=None, target=None, copier=None):
     """The program the service should run. A frozen program first copies itself into the app's own folder on the local
     disk and the service points at that copy: started from a network share or a download folder, the log-on task
@@ -128,10 +168,10 @@ def install(data_dir, runner=subprocess.run, platform=None, unit_dir=None, app_t
     if platform == "win32":
         xml = data_dir / "task.xml"
         xml.write_text(build_task_xml(*windowless(program, args)), encoding="utf-16")
-        ok = _ok(runner, schtasks_create(xml))
+        ok, said = _run_text(runner, schtasks_create(xml))
         if ok:                                       # also start it for this session so no log-off is needed
             _ok(runner, ["schtasks", "/Run", "/TN", TASK_NAME])
-        return ok
+        return Installed(ok, denied=not ok and access_denied(said))
     unit_dir = Path(unit_dir) if unit_dir else Path.home() / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
     (unit_dir / UNIT_NAME).write_text(build_unit(program, args, workdir=data_dir), encoding="utf-8")
@@ -142,8 +182,8 @@ class Removal:
     """What uninstall did. Truthy when the service is removed AND the background program has gone (or was not running);
     `removed` is the start-up entry, `closing` is a background program that was asked to end and has not gone yet."""
 
-    def __init__(self, removed, closing=False):
-        self.removed, self.closing = bool(removed), bool(closing)
+    def __init__(self, removed, closing=False, denied=False):
+        self.removed, self.closing, self.denied = bool(removed), bool(closing), bool(denied)
 
     def __bool__(self):
         return self.removed and not self.closing
@@ -154,6 +194,12 @@ class Removal:
         if self.removed:
             return ("Service removed from start-up, but the background program is still closing (it hands its job "
                     "back first). It will be gone in a minute or two.")
+        if self.denied:
+            # seen on the owner's PC 2026-11-14: the entry had been created from an administrator window
+            return ("Windows would not let this program remove the service: it was installed from an administrator "
+                    "window. The background program has " + ("been asked to stop" if self.closing else "stopped") +
+                    " for now, but it will start again when you next sign in. To remove it for good, open a terminal "
+                    "as administrator and run\n    " + ADMIN_REMOVE)
         return missing + (" The background program is still closing." if self.closing else "")
 
 
@@ -205,9 +251,9 @@ def uninstall(runner=subprocess.run, platform=None, unit_dir=None, data_dir=None
     platform = platform or sys.platform
     if platform == "win32":
         _ok(runner, ["schtasks", "/End", "/TN", TASK_NAME])
-        removed = _ok(runner, schtasks_delete())
+        removed, said = _run_text(runner, schtasks_delete())
         gone = stop_background(data_dir, alive, sleep, clock, wait) if data_dir else True
-        return Removal(removed, closing=not gone)
+        return Removal(removed, closing=not gone, denied=not removed and access_denied(said))
     _ok(runner, systemctl("disable", "--now", UNIT_NAME))
     unit_dir = Path(unit_dir) if unit_dir else Path.home() / ".config" / "systemd" / "user"
     try:

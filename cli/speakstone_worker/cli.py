@@ -298,10 +298,38 @@ def board_state(install, queue, gpu, state, started, now=None, events=None, work
     s["time_left"] = stats.time_left(queue, s["words_hour"], s["lines_hour"])
     s["since_label"] = time.strftime("%H:%M", time.localtime(s["first_today"] or started))
     if s["making"]:
-        s["job_pct"] = min(0.95, (now - s["job_started"]) / max(1.0, s["avg_job_seconds"]))
+        # Count the lines that are made, do not guess from the clock: the guess sat at "95%" for ten minutes on a job
+        # that was two thirds done because something else was sharing the card (owner, 2026-11-14). The clock is only
+        # used while the first line is not out yet (the engine is loading), and then it stops short of the first line.
+        done = lines_made(install, s.get("job"))
+        s["job_done"] = done
+        total = s.get("job_lines") or 0
+        if done and total:
+            s["job_pct"] = min(1.0, done / total)
+        else:
+            guess = (now - s["job_started"]) / max(1.0, s["avg_job_seconds"])
+            s["job_pct"] = min(guess, (0.5 / total) if total else 0.05)
     if state == "paused":
         s["making"] = False
     return s
+
+
+def lines_made(install, job):
+    """How many lines of the job in hand exist as finished clips (held ones count: they are made). 0 when unknown."""
+    if not job:
+        return 0
+    n = 0
+    try:
+        for work in Path(install).glob("work*"):
+            out = work / "jobs" / str(job) / "out"
+            if out.is_dir():
+                n += sum(1 for p in out.glob("*.ogg"))
+                held = out / "_held_qc"
+                if held.is_dir():
+                    n += sum(1 for p in held.glob("*.ogg"))
+    except OSError:
+        return 0
+    return n
 
 
 def start_now(console, install, settings, flow=None, keep=None, respect_pause=False):
@@ -511,8 +539,9 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             elif not v:
                 st["pause_from"] = st["pause_to"] = ""
         elif k == "3":
-            console.print(service.uninstall(data_dir=install).sentence())
-            time.sleep(1.5)
+            gone = service.uninstall(data_dir=install)
+            console.print(gone.sentence())
+            time.sleep(1.5 if gone else 8)
         elif k == "4":
             console.print(rename_flow(console, install))
             time.sleep(2.5)
@@ -1508,13 +1537,18 @@ def main(argv=None):
                 first = False
             elif choice == "2":
                 if service.is_installed():
-                    console.print(service.uninstall(data_dir=install).sentence("Could not remove the service."))
+                    gone = service.uninstall(data_dir=install)
+                    console.print(gone.sentence("Could not remove the service."))
+                    if not gone:
+                        time.sleep(8)                    # the explanation is long: give it time to be read
                 elif ensure_setup(console, install):
                     ok = service.install(install)
-                    console.print("Installed. It starts when your PC has been idle for "
-                                  f"{st['idle_minutes']} minutes." if ok else
-                                  "Could not install the service (the program could not be copied into its own folder, "
-                                  "or the task was refused).")
+                    console.print(ok.sentence(st["idle_minutes"]) if hasattr(ok, "sentence") else (
+                        f"Installed. It starts when your PC has been idle for {st['idle_minutes']} minutes." if ok else
+                        "Could not install the service (the program could not be copied into its own folder, "
+                        "or the task was refused)."))
+                    if not ok:
+                        time.sleep(6)                    # the explanation is long: give it time to be read
                 time.sleep(2)
             elif choice == "3":
                 if settings_menu(console, install, st, flow,
