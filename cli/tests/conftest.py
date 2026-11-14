@@ -1,4 +1,5 @@
-"""Tests never reach GitHub, never open a tray icon, never swap a program, and never touch a real install.
+"""Tests never reach GitHub, never open a tray icon, never swap a program, never start the real service, and never
+touch a real install.
 
 Why the last one: on 2026-11-11 a test of the old app (app/tests/test_cli.py, first-run setup) ran with no install folder
 set, so it used the real default (%LOCALAPPDATA%\\SpeakStoneWorker) and its fake downloads left 1-byte placeholder
@@ -11,6 +12,7 @@ import pytest
 def _no_update_no_tray(monkeypatch):
     monkeypatch.setenv("SSW_NO_UPDATE", "1")
     monkeypatch.setenv("SSW_NO_TRAY", "1")
+    monkeypatch.setenv("SSW_NO_SERVICE_WAKE", "1")     # opening the window in a test must never start the real service
 
 
 @pytest.fixture(autouse=True)

@@ -1254,6 +1254,27 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
         drop_background_pid(install)
 
 
+def wake_service(install, installed=None, running=None, start=None, log=None):
+    """Opening the window brings the background service back when it is installed but not running. The tray's
+    "Quit" stops the service until the next sign-in; a person who then opened the app had a working program and no
+    tray icon, and no service to carry on once the window was closed (owner, 2026-11-14). -> True when it asked the
+    service to start. Never raises."""
+    try:
+        if os.environ.get("SSW_NO_SERVICE_WAKE") and start is None:     # tests: never touch the real service
+            return False
+        if not (installed or service.is_installed)():
+            return False
+        if (running or service.background_running)(install):
+            return False
+        ok = bool((start or service.start)())
+        (log or (lambda text: log_background_error(install, text)))(
+            "the service was installed but not running; started it" if ok else
+            "the service was installed but not running, and could not be started")
+        return ok
+    except Exception:
+        return False
+
+
 def write_background_pid(install):
     """So that "remove the service" can tell whether this program is still running. Best effort."""
     try:
@@ -1443,6 +1464,7 @@ def main(argv=None):
         return background(install, st)
     console = make_console()
     set_title(window_title())
+    threading.Thread(target=lambda: wake_service(install), daemon=True).start()
     flow = update.UpdateFlow(log=lambda text: log_background_error(install, text), app_exe=paths.app_exe(), args=[])
     update.cleanup_old(flow.exe)
     looker = None

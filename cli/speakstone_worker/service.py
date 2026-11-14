@@ -164,6 +164,21 @@ def background_pid(data_dir):
         return None
 
 
+def background_running(data_dir, alive=locking.pid_alive):
+    """Is the background program (the service, with its tray icon) running right now?"""
+    pid = background_pid(data_dir)
+    return bool(pid) and bool(alive(pid))
+
+
+def start(runner=subprocess.run, platform=None):
+    """Start the installed service now (it normally starts when the person signs in). -> True when the request was
+    accepted. The Windows task ignores a second start while it is already running, so asking twice is harmless."""
+    platform = platform or sys.platform
+    if platform == "win32":
+        return _ok(runner, ["schtasks", "/Run", "/TN", TASK_NAME])
+    return _ok(runner, systemctl("start", UNIT_NAME))
+
+
 def stop_background(data_dir, alive=locking.pid_alive, sleep=time.sleep, clock=time.monotonic, wait=20.0):
     """Windows: ending the Scheduled Task does not end the background program it started (conhost --headless keeps it,
     with its worker and its tray icon), so the person was told "removed" while it carried on. Ask it to quit through

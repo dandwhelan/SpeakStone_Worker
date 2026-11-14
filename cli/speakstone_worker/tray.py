@@ -43,7 +43,9 @@ def build_menu(version, status, paused, settings, update_version=None, label="")
     items += [Item("check", "Check for updates now", True, None, False),
               Item("logs", "Open the log folder", True, None, False),
               SEPARATOR,
-              Item("quit", "Quit", True, None, False)]
+              # says what it does: "Quit" alone read like closing a menu, and the service then stayed off until the
+              # next sign-in with nothing on screen to say so (2026-11-14). Opening the app starts it again.
+              Item("quit", "Stop the background service (until you open the app or sign in again)", True, None, False)]
     return items
 
 
