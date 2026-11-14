@@ -246,6 +246,11 @@ def load_model(device):
     return tts
 
 
+# References are 5 to 10 seconds. A hostile queue could send a 20 MB clip that expands to hundreds of MB of wav, so the
+# conversion stops reading after this many seconds (2026-11-14 review).
+REF_MAX_SECONDS = 30
+
+
 def prepare_reference(refs_dir, ref_clip, cache_dir):
     """IndexTTS-2 reads a wav and the references are mostly Ogg, so each clip is converted once (24 kHz mono) and
     reused. In serve mode cache_dir outlives the job, so the next job with the same voice does not convert it again.
@@ -258,7 +263,7 @@ def prepare_reference(refs_dir, ref_clip, cache_dir):
     if not out.exists():
         part = out.with_name(out.stem + f".{os.getpid()}.part.wav")
         r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-ac", "1", "-ar", "24000",
-                            str(part)], capture_output=True, text=True, timeout=60)
+                            "-t", str(REF_MAX_SECONDS), str(part)], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             try:
                 part.unlink()

@@ -20,6 +20,7 @@ import argparse
 import email.utils
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -102,6 +103,12 @@ EXIT_BROKEN = 7                         # job after job, not one line could be m
 # hub gave 14 groups up. After a job with NOT ONE line made the worker waits; after this many in a row it stops.
 DEAD_JOBS_LIMIT = 2
 DEAD_JOB_WAIT_SECONDS = 120
+# The brake only counted jobs with not one line made, and any other failure reset it, so a PC whose engine stalled on
+# every job or whose uploads always failed failed a job every 15 minutes for ever (2026-11-14 review). Now ANY failed
+# job counts, except the user's own stop and a yield hand-back; only a completed job resets it. The wait after a failed
+# job doubles for each failure in the row (120, 240, 480 ... up to the cap), and this many in a row stop the worker.
+FAILED_JOBS_LIMIT = 5
+FAILED_JOB_WAIT_CAP_SECONDS = 1800
 BROKEN_FILE = "CANNOT_MAKE_LINES"       # the last error, for the app to show
 BUSY_MESSAGE = "Another SpeakStone Worker is already running with this key on this PC"
 MAX_REFS_PER_JOB = 40                    # 8 until 1.2.8; a chunk mixes many voices and 8 closed most jobs under 20 lines
@@ -681,17 +688,59 @@ REF_MARGIN_BYTES = 1024               # a reference may overrun its declared siz
 UPLOAD_HEADERS = ("content-type", "content-length")
 
 
+_transfer_api = {"host": "", "loopback": False}
+
+
+def _host_is_local(host):
+    """True for localhost names and for IP literals that point at this machine or its own network."""
+    h = (host or "").strip("[]").lower().rstrip(".")
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h.split("%")[0])
+    except ValueError:
+        return False
+    return (ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified
+            or (ip.version == 6 and ip in ipaddress.ip_network("fc00::/7")))
+
+
+def _is_loopback(host):
+    h = (host or "").strip("[]").lower().rstrip(".")
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(h.split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def set_transfer_policy(api_base):
+    """Called once when a Worker starts. Why: a transfer link comes from the site, and a hostile site could point it at
+    the volunteer's own machine or network (2026-11-14 review). Until this is called the strict rule applies."""
+    host = urllib.parse.urlsplit(str(api_base or "")).hostname or ""
+    _transfer_api["host"] = host.lower()
+    _transfer_api["loopback"] = _is_loopback(host)
+
+
 def check_url(url):
-    """Only https:// URLs (loopback http:// for tests) may be opened. Any other scheme (file:, ftp:, data:, ...) is refused. -> url."""
+    """Only https:// URLs (loopback http:// when the site address itself is loopback, for tests) may be opened. Any
+    other scheme (file:, ftp:, data:, ...) is refused, and so is a link to this machine or its network unless the
+    site address is that same host. -> url."""
     try:
         parts = urllib.parse.urlsplit(url)
         host = parts.hostname or ""
     except (ValueError, AttributeError):
         raise NetError("refused: not a valid URL") from None
-    if parts.scheme == "https" and host:
+    if _transfer_api["loopback"] or host.lower() == _transfer_api["host"]:
+        local_ok = True
+    else:
+        local_ok = not _host_is_local(host)
+    if parts.scheme == "https" and host and local_ok:
         return url
-    if parts.scheme == "http" and host in LOOPBACK:
+    if parts.scheme == "http" and host in LOOPBACK and _transfer_api["loopback"]:
         return url
+    if parts.scheme in ("http", "https") and host and not local_ok:
+        raise NetError("refused: link points at this computer or its network")
     raise NetError(f"refused: URL scheme {parts.scheme[:12] or '?'!r} is not allowed")
 
 
@@ -1362,6 +1411,7 @@ class Worker:
     def __init__(self, cfg, log=None, gpu_query=query_gpu, skip_vram_wait=None, max_cycles=None,
                  install_signals=True):
         self.cfg = cfg
+        set_transfer_policy(cfg.api_base)
         self.work = cfg.work_dir
         self.jobs_dir = self.work / "jobs"
         self.refs_dir = self.work / "refs"
@@ -1798,11 +1848,15 @@ class Worker:
             self.log.event("error", None, where="claim", error="malformed job answer")
             self.sleep(self.backoff.next())
             return
-        jobdir = self.safe_job_dir(job_id)
-        jobdir.mkdir(parents=True, exist_ok=True)
         attempt = job.get("attempt")
-        atomic_write_json(jobdir / "state.json", {"job_id": job_id, "lease_id": lease_id, "attempt": attempt,
-                                                  "payload": payload})
+        try:
+            jobdir = self.safe_job_dir(job_id)
+            jobdir.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(jobdir / "state.json", {"job_id": job_id, "lease_id": lease_id, "attempt": attempt,
+                                                      "payload": payload})
+        except Exception as e:
+            self.setup_failed(job_id, lease_id, attempt, payload, e)
+            return
         ctx = JobCtx(job_id, lease_id, attempt, payload, jobdir)
         ctx.worker = self
         self._current = ctx
@@ -1835,32 +1889,72 @@ class Worker:
             self.engine_shutdown("exit")
             raise
         except JobFail as f:
-            try:
-                self.send_fail(ctx, f)
-            except Stop:
-                self.release(ctx)
-                raise
-            if f.reason == "gpu_fatal":
-                after_wait = GPU_FATAL_WAIT_SECONDS
-            if getattr(f, "none_made", False):
-                self._dead_jobs = getattr(self, "_dead_jobs", 0) + 1
-                if self._dead_jobs >= DEAD_JOBS_LIMIT:
-                    self.log.event("stop", None, reason="cannot make lines", code=EXIT_BROKEN, error=f.message)
-                    try:
-                        (self.work / BROKEN_FILE).write_text(f.message, encoding="utf-8")
-                    except OSError:
-                        pass
-                    self.engine_shutdown("broken")
-                    raise ExitRun(EXIT_BROKEN, "not one line could be made, two jobs in a row")
-                after_wait = max(after_wait or 0, DEAD_JOB_WAIT_SECONDS)
-            else:
-                self._dead_jobs = 0
+            after_wait = self.after_fail(ctx, f)
+        except Exception as e:
+            # Anything else used to escape: no fail was sent, the engine kept running and the job stayed leased with its
+            # folder kept for a resume, so a job that always crashed the worker came back for ever (2026-11-14 review).
+            # Only the type name is sent: never a traceback or a path.
+            kill_tree(ctx.proc)
+            self.log.event("error", job_id, where="job", error=type(e).__name__)
+            after_wait = self.after_fail(ctx, JobFail("worker_error", f"unexpected {type(e).__name__} in the worker",
+                                                      True, True))
         finally:
             hb.stop()
             self._current = None
         if after_wait:
-            self.log.event("idle", None, reason="gpu_fatal", wait=after_wait)
+            self.log.event("idle", None, reason="failed_job", wait=after_wait)
             self.sleep(after_wait)
+
+    def after_fail(self, ctx, f):
+        """Send a job's failure to the site and apply the brake. -> seconds to wait before the next job."""
+        try:
+            self.send_fail(ctx, f)
+        except Stop:
+            self.release(ctx)
+            raise
+        return self.brake(f)
+
+    def brake(self, f):
+        """Count a failed job and decide whether to wait or stop. -> seconds to wait before the next job. A failure that
+        is not this PC's fault or is the user's choice (reason "released") counts for nothing."""
+        if f.reason == "released":
+            return 0
+        self._failed_jobs = getattr(self, "_failed_jobs", 0) + 1
+        none_made = bool(getattr(f, "none_made", False))
+        self._dead_jobs = getattr(self, "_dead_jobs", 0) + 1 if none_made else 0
+        if self._dead_jobs >= DEAD_JOBS_LIMIT or self._failed_jobs >= FAILED_JOBS_LIMIT:
+            self.log.event("stop", None, reason="cannot make lines", code=EXIT_BROKEN, error=f.message)
+            try:
+                (self.work / BROKEN_FILE).write_text(f.message, encoding="utf-8")
+            except OSError:
+                pass
+            self.engine_shutdown("broken")
+            raise ExitRun(EXIT_BROKEN, "jobs keep failing on this PC: "
+                          + ("not one line could be made" if self._dead_jobs >= DEAD_JOBS_LIMIT else "too many in a row"))
+        wait = min(DEAD_JOB_WAIT_SECONDS * 2 ** (self._failed_jobs - 1), FAILED_JOB_WAIT_CAP_SECONDS)
+        return max(wait, GPU_FATAL_WAIT_SECONDS if f.reason == "gpu_fatal" else 0)
+
+    def setup_failed(self, job_id, lease_id, attempt, payload, exc):
+        """The job folder could not be made or written (disk full, no permission) before the job even started. Give the
+        job back as a retryable failure so it does not sit leased for its whole lease, and carry on: this must not
+        crash the loop. One try only; a stop or exit still passes through."""
+        self.log.event("error", job_id, where="job_setup", error=type(exc).__name__)
+        ctx = JobCtx(job_id, lease_id, attempt, payload, self.jobs_dir / str(job_id))
+        ctx.worker = self
+        f = JobFail("worker_error", f"could not prepare the job folder ({type(exc).__name__})", True, True)
+        try:
+            self.log.event("fail", job_id, reason=f.reason, retryable=True, message=f.message)
+            self.post_job("fail", {"reason": f.reason, "message": safe_msg(f.message)[:500], "retryable": True}, ctx,
+                          retry=False)
+        except (Stop, ExitRun):
+            raise
+        except Exception as e:
+            self.log.event("fail", job_id, reason=f.reason, note=f"not delivered: {describe_exc(e)}")
+        try:
+            self.delete_job_dir(job_id)
+        except Exception:
+            pass
+        self.sleep(max(self.brake(f), self.backoff.next()))
 
     def release(self, ctx, message="worker stopped"):
         """Ctrl+C / STOP: give the job back (attempt refunded). One try only: the user wants out."""
@@ -1961,6 +2055,7 @@ class Worker:
         load_s = round(ctx.load_s, 1) if self.engine_keep() else None
         gen_s = round(max(0.0, ctx.synth_s - (ctx.load_s if self.engine_keep() else 0.0)), 1)
         self._dead_jobs = 0
+        self._failed_jobs = 0
         try:
             (self.work / BROKEN_FILE).unlink()
         except OSError:
@@ -2150,7 +2245,7 @@ class Worker:
             for attempt in range(1, 4):
                 ok = False
                 try:
-                    s, _ = http_request(entry.get("method") or "PUT", entry["url"], headers=safe_upload_headers(entry.get("headers")),
+                    s, _ = http_request("PUT", entry["url"], headers=safe_upload_headers(entry.get("headers")),
                                         data=v["path"].read_bytes(), timeout=120)
                     ok = 200 <= s < 300
                     err = f"HTTP {s}"
