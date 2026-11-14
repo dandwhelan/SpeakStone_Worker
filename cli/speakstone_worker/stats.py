@@ -1,6 +1,7 @@
 """Board data: the worker's own log, one nvidia-smi reading, and the public queue figures.
 Also what the live board shows: words, audio minutes, history and events."""
 import json
+import os
 import re
 import subprocess
 import sys
@@ -172,20 +173,44 @@ def summarize(events, now, avg_job_seconds_default=60.0):
     return out
 
 
-def gpu_reading(runner=subprocess.run):
+def gpu_index(env=None):
+    """The card named by SSW_GPU (a small whole number, as nvidia-smi lists them), or None. The same rule the worker
+    follows (net_worker.gpu_index), so the board shows the card the worker really uses."""
+    env = os.environ if env is None else env
+    v = str(env.get("SSW_GPU") or "").strip()
+    return int(v) if v.isdigit() and int(v) < 64 else None
+
+
+def gpu_reading(runner=subprocess.run, env=None, biggest=False):
+    """One nvidia-smi reading. SSW_GPU set: that card only (`-i <n>`). Otherwise card 0 (what a worker without SSW_GPU
+    uses), or with `biggest` the card with the most memory (the "is this PC good enough" checks: a PC with a small card
+    in slot 0 and a large one beside it was refused). Before 2026-11-14 the first line was always read, whatever the
+    worker was pinned to."""
     try:
-        r = runner(["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,name",
-                    "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
-        vals = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
-        t, u, mu, mt = (int(float(v)) for v in vals[:4])
-        return {"temp_c": t, "util_pct": u, "mem_used_mib": mu, "mem_total_mib": mt,
-                "name": vals[4] if len(vals) > 4 else "NVIDIA graphics card"}
+        cmd = ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,name",
+               "--format=csv,noheader,nounits"]
+        i = gpu_index(env)
+        if i is not None:
+            cmd += ["-i", str(i)]
+        r = runner(cmd, capture_output=True, text=True, timeout=5)
+        found = []
+        for line in r.stdout.strip().splitlines():
+            try:
+                vals = [x.strip() for x in line.split(",")]
+                t, u, mu, mt = (int(float(v)) for v in vals[:4])
+            except ValueError:
+                continue
+            found.append({"temp_c": t, "util_pct": u, "mem_used_mib": mu, "mem_total_mib": mt,
+                          "name": vals[4] if len(vals) > 4 else "NVIDIA graphics card"})
+        if not found:
+            return None
+        return max(found, key=lambda g: g["mem_total_mib"]) if biggest and i is None and len(found) > 1 else found[0]
     except Exception:
         return None
 
 
-def gpu_total_mib(runner=subprocess.run):
-    g = gpu_reading(runner)
+def gpu_total_mib(runner=subprocess.run, env=None):
+    g = gpu_reading(runner, env, biggest=True)
     return g["mem_total_mib"] if g else None
 
 
