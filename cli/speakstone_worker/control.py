@@ -64,12 +64,14 @@ IDLE_STATUS = {"yield": "Paused for another program using the graphics card", "v
 
 
 def status_for(running, making, paused, updating=False, drain=None, until=None, foreign=False, lines=0,
-               idle_reason=None):
+               idle_reason=None, broken=None):
     """The one-line status the tray shows. Pure. `drain` is control.drain_reason."""
     if updating:
         return UPDATING
     if drain == "update" and running:
         return UPDATING_AFTER
+    if broken and not running:                   # a worker that could not make a line stays off until the person acts
+        return broken
     if paused:
         if running:
             return PAUSING

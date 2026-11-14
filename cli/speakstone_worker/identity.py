@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 
 from . import __version__
+from .net import open_url
 
 REFRESH_SECONDS = 24 * 3600            # a known label is re-read at most this often
 RETRY_SECONDS = 30 * 60                # an unknown label is retried at most this often (background loop)
@@ -50,7 +51,7 @@ def is_fresh(info, now):
     return bool(info.get("label")) and age < REFRESH_SECONDS
 
 
-def fetch(base, key, opener=urllib.request.urlopen, timeout=TIMEOUT):
+def fetch(base, key, opener=open_url, timeout=TIMEOUT):
     """-> {"label", "tier"} from the site, or None on any failure."""
     req = urllib.request.Request(base.rstrip("/") + "/api/worker/me", method="GET",
                                  headers={"Authorization": f"Bearer {key}", "Accept": "application/json",
@@ -87,7 +88,7 @@ def save(install, info, now):
     return d
 
 
-def refresh(install, base, opener=urllib.request.urlopen, now=None, timeout=TIMEOUT, force=False):
+def refresh(install, base, opener=open_url, now=None, timeout=TIMEOUT, force=False):
     """Ask the site when the label is unknown or a day old and a key exists. -> the saved info (possibly empty)."""
     now = time.time() if now is None else now
     info = cached(install)
@@ -134,7 +135,7 @@ def _error_text(err):
         return ""
 
 
-def rename(install, base, name, opener=urllib.request.urlopen, timeout=10.0, now=None):
+def rename(install, base, name, opener=open_url, timeout=10.0, now=None):
     """POST the new label. -> (True, "Renamed to X") or (False, sentence in plain words). Never includes the key."""
     name, why = check_name(name)
     if not name:

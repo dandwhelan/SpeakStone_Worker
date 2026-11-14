@@ -3,6 +3,8 @@ import json
 import urllib.error
 import urllib.request
 
+from .net import open_url
+
 
 class EnrollError(Exception):
     """Message is written for the person at the keyboard. Never contains a key."""
@@ -32,7 +34,7 @@ def _error_code(err):
         return None
 
 
-def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener=urllib.request.urlopen, timeout=30):
+def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener=open_url, timeout=30):
     body = json.dumps({"machine_name": machine_name, "gpu": gpu, "vram_mib": int(vram_mib), "os": os_name,
                        "worker_version": worker_version}).encode("utf-8")
     req = urllib.request.Request(api_base.rstrip("/") + "/api/worker/enroll", data=body, method="POST",

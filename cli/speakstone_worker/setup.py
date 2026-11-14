@@ -889,7 +889,18 @@ def sync_worker_files(env_or_install, resource_dir=None):
             continue
         try:
             if not dst.exists() or dst.read_bytes() != src.read_bytes():
-                shutil.copy2(src, dst)
+                # Copy to a name beside the target and swap it in: copying straight over the file truncates it first,
+                # and a service starting a worker from it at that moment ran a half-written script.
+                tmp = dst.with_name(dst.name + ".new")
+                try:
+                    shutil.copy2(src, tmp)
+                    os.replace(tmp, dst)
+                finally:
+                    if tmp.exists():
+                        try:
+                            tmp.unlink()
+                        except OSError:
+                            pass
                 changed.append(n)
         except OSError:
             pass
