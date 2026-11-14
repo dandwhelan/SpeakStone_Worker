@@ -1,6 +1,15 @@
 # Builds the one-file app for Windows and Linux. Runs the tests first.
-# A tag like v1.2.0 also attaches both files, each with a `.sha256` fingerprint file, to a release with that name.
+# A tag like v1.2.0 publishes a release with that name holding both files, each with a `.sha256` fingerprint file.
 # The program checks that fingerprint before it installs an update, so a release without one is never installed.
+#
+# Two jobs on purpose (2026-11-14). Until 1.2.15 each build attached its own files to the release as soon as it
+# finished. Linux finishes a few minutes before Windows, so the release was already "latest" with no Windows file in
+# it, and a Windows PC checking in that gap was told there was nothing for it; a failed Windows build left a
+# Linux-only release live. Now the builds only hand their files on, and ONE job publishes all four together, after
+# checking they are all there and match their fingerprints.
+#
+# A tag with a hyphen (v1.2.16-rc1) is published as a pre-release. Installed programs only look at the latest full
+# release, so a pre-release reaches nobody by itself: it is the way to try a build on one PC before everyone gets it.
 name: build
 
 on:
@@ -9,7 +18,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   app:
@@ -49,10 +58,36 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: out/${{ matrix.asset }}*
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
+          if-no-files-found: error
+
+  release:
+    # only for a tag, and only when BOTH builds succeeded
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: app
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: All four files, each matching its fingerprint
+        working-directory: out
+        run: |
+          ls -l
+          for f in SpeakStoneWorker-windows.exe SpeakStoneWorker-linux; do
+            test -s "$f" || { echo "missing $f"; exit 1; }
+            test -s "$f.sha256" || { echo "missing $f.sha256"; exit 1; }
+            sha256sum -c "$f.sha256"
+          done
+      - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: |
-            out/${{ matrix.asset }}
-            out/${{ matrix.asset }}.sha256
+            out/SpeakStoneWorker-windows.exe
+            out/SpeakStoneWorker-windows.exe.sha256
+            out/SpeakStoneWorker-linux
+            out/SpeakStoneWorker-linux.sha256
