@@ -147,7 +147,8 @@ class Installed(int):
 
     def sentence(self, idle_minutes):
         if self:
-            return f"Installed. It starts when your PC has been idle for {idle_minutes} minutes."
+            return (f"Installed. It starts when your PC has been idle for {idle_minutes} minutes. "
+                    "Its tray icon can take up to a minute to appear.")
         if self.denied:
             return ("Windows would not let this program install the service. If an older copy of it was installed "
                     "from an administrator window, open a terminal as administrator, run\n    " + ADMIN_REMOVE +
@@ -183,7 +184,7 @@ def install(data_dir, runner=subprocess.run, platform=None, unit_dir=None, app_t
         xml = data_dir / "task.xml"
         xml.write_text(build_task_xml(*windowless(program, args)), encoding="utf-16")
         ok, said = _run_text(runner, schtasks_create(xml))
-        if ok:                                       # also start it for this session so no log-off is needed
+        if ok and not background_running(data_dir):  # also start it for this session so no log-off is needed
             _ok(runner, ["schtasks", "/Run", "/TN", TASK_NAME])
         return Installed(ok, denied=not ok and access_denied(said))
     unit_dir = Path(unit_dir) if unit_dir else Path.home() / ".config" / "systemd" / "user"

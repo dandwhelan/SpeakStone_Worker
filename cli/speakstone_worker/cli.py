@@ -1262,8 +1262,38 @@ def idle_reason_now(install, workers=1, now=None):
         return None
 
 
-def background(install, st, flow=None, tray_start=tray_mod.start, making=job_running_now):
+def other_background(install, me=None, alive=locking.pid_alive, table=None, sleep=time.sleep, wait=15.0):
+    """pid of ANOTHER background program that is running for this data folder, or None. Two were seen at once on the
+    owner's PC (2026-11-14): the first took 40 seconds to show its tray icon, "install" was chosen again, and a second
+    copy started beside it with a second icon. A copy that is just leaving (an update or a restart hands over to us)
+    is given `wait` seconds to go. Windows reuses process numbers, so the number must also belong to this program.
+    Never raises."""
+    try:
+        me = os.getpid() if me is None else me
+        end = time.monotonic() + wait
+        while True:
+            pid = service.background_pid(install)
+            if not pid or pid == me or not alive(pid):
+                return None
+            if sys.platform == "win32" or table is not None:
+                t = update._process_table() if table is None else table
+                mine = (t.get(me) or (None, ""))[1].lower()
+                theirs = (t.get(pid) or (None, ""))[1].lower()
+                if t and mine and theirs != mine:
+                    return None                      # the number now belongs to some other program
+            if time.monotonic() >= end:
+                return pid
+            sleep(1.0)
+    except Exception:
+        return None
+
+
+def background(install, st, flow=None, tray_start=tray_mod.start, making=job_running_now, other=None):
     """The service. Whatever ends it, one line in background.log says why (a hard kill cannot be logged)."""
+    there = (other or other_background)(install)
+    if there:
+        log_background_error(install, f"a background program is already running (process {there}); not starting a second")
+        return 0
     note = ExitNote(install)
     trim_background_log(Path(install) / "work" / "logs" / "background.log")
     log_background_error(install, f"background {__version__} started")
