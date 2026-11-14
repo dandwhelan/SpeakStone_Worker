@@ -12,11 +12,16 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from . import locking
+
 TASK_NAME = "SpeakStone Worker"
 UNIT_NAME = "speakstone-worker.service"
+QUIT_FILE = "QUIT_SERVICE"          # written in the data folder to ask the running background program to end
+BACKGROUND_PID = "background.pid"   # the running background program's process number (removed when it ends)
 
 
 def launch_command(frozen=None, executable=None):
@@ -133,18 +138,68 @@ def install(data_dir, runner=subprocess.run, platform=None, unit_dir=None, app_t
     return (_ok(runner, systemctl("daemon-reload")) and _ok(runner, systemctl("enable", "--now", UNIT_NAME)))
 
 
-def uninstall(runner=subprocess.run, platform=None, unit_dir=None):
+class Removal:
+    """What uninstall did. Truthy when the service is removed AND the background program has gone (or was not running);
+    `removed` is the start-up entry, `closing` is a background program that was asked to end and has not gone yet."""
+
+    def __init__(self, removed, closing=False):
+        self.removed, self.closing = bool(removed), bool(closing)
+
+    def __bool__(self):
+        return self.removed and not self.closing
+
+    def sentence(self, missing="No service was installed."):
+        if self.removed and not self.closing:
+            return "Service removed."
+        if self.removed:
+            return ("Service removed from start-up, but the background program is still closing (it hands its job "
+                    "back first). It will be gone in a minute or two.")
+        return missing + (" The background program is still closing." if self.closing else "")
+
+
+def background_pid(data_dir):
+    try:
+        return int((Path(data_dir) / BACKGROUND_PID).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def stop_background(data_dir, alive=locking.pid_alive, sleep=time.sleep, clock=time.monotonic, wait=20.0):
+    """Windows: ending the Scheduled Task does not end the background program it started (conhost --headless keeps it,
+    with its worker and its tray icon), so the person was told "removed" while it carried on. Ask it to quit through
+    the QUIT_SERVICE file (it checks every few seconds, hands the job back and leaves) and wait up to `wait` seconds.
+    -> True when it has gone or was not running."""
+    pid = background_pid(data_dir)
+    if not pid or not alive(pid):
+        return True
+    try:
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        (Path(data_dir) / QUIT_FILE).write_text("quit", encoding="utf-8")
+    except OSError:
+        return False
+    end = clock() + wait
+    while clock() < end:
+        if not alive(pid):
+            return True
+        sleep(0.5)
+    return not alive(pid)
+
+
+def uninstall(runner=subprocess.run, platform=None, unit_dir=None, data_dir=None, alive=locking.pid_alive,
+              sleep=time.sleep, clock=time.monotonic, wait=20.0):
     platform = platform or sys.platform
     if platform == "win32":
         _ok(runner, ["schtasks", "/End", "/TN", TASK_NAME])
-        return _ok(runner, schtasks_delete())
+        removed = _ok(runner, schtasks_delete())
+        gone = stop_background(data_dir, alive, sleep, clock, wait) if data_dir else True
+        return Removal(removed, closing=not gone)
     _ok(runner, systemctl("disable", "--now", UNIT_NAME))
     unit_dir = Path(unit_dir) if unit_dir else Path.home() / ".config" / "systemd" / "user"
     try:
         (unit_dir / UNIT_NAME).unlink()
     except OSError:
         pass
-    return _ok(runner, systemctl("daemon-reload"))
+    return Removal(_ok(runner, systemctl("daemon-reload")))
 
 
 def is_installed(runner=subprocess.run, platform=None, unit_dir=None):

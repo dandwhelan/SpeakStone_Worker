@@ -511,7 +511,7 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             elif not v:
                 st["pause_from"] = st["pause_to"] = ""
         elif k == "3":
-            console.print("Service removed." if service.uninstall() else "No service was installed.")
+            console.print(service.uninstall(data_dir=install).sentence())
             time.sleep(1.5)
         elif k == "4":
             console.print(rename_flow(console, install))
@@ -557,7 +557,7 @@ def remove_program(console, install, ask=input, remover=uninstall.remove_everyth
         sleep(1.5)
         return False
     console.print("Deleting...")
-    r = remover(install, stop_workers=lambda: stop_all_workers(install), remove_service=service.uninstall)
+    r = remover(install, stop_workers=lambda: stop_all_workers(install), remove_service=lambda: service.uninstall(data_dir=install))
     if r["ok"]:
         console.print(f"Done. {r['freed'] / 1e9:.1f} GB freed. You can now delete the SpeakStoneWorker program file itself.")
     else:
@@ -1238,6 +1238,7 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
     note = ExitNote(install)
     trim_background_log(Path(install) / "work" / "logs" / "background.log")
     log_background_error(install, f"background {__version__} started")
+    write_background_pid(install)
     try:
         code = _background(install, st, note, flow, tray_start, making)
         note.set("setup not finished" if code == 2 else "stopped")
@@ -1250,6 +1251,40 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
         raise
     finally:
         note.write()
+        drop_background_pid(install)
+
+
+def write_background_pid(install):
+    """So that "remove the service" can tell whether this program is still running. Best effort."""
+    try:
+        Path(install).mkdir(parents=True, exist_ok=True)
+        (Path(install) / service.BACKGROUND_PID).write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def drop_background_pid(install):
+    """Only our own number: a restart after an update may already have written its own."""
+    p = Path(install) / service.BACKGROUND_PID
+    try:
+        if p.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            p.unlink()
+    except OSError:
+        pass
+
+
+def take_quit_request(install, control):
+    """service.uninstall() writes QUIT_SERVICE in the data folder (Scheduled Task removal does not end this program).
+    Found: quit exactly as the tray's Quit does (the worker hands its job back), and delete the file. -> True if found."""
+    p = Path(install) / service.QUIT_FILE
+    try:
+        if not p.exists():
+            return False
+        p.unlink()
+    except OSError:
+        pass
+    control.request_quit()
+    return True
 
 
 def _background(install, st, note, flow, tray_start, making, job_lines=None, idle_reason=None):
@@ -1293,6 +1328,10 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
     try:
         while not control.quit:
             try:
+                if take_quit_request(install, control):
+                    note.set("service removed")
+                    log("the service was removed: quitting")
+                    break
                 reload = getattr(st, "reload", None)
                 if reload:
                     reload()
@@ -1447,7 +1486,7 @@ def main(argv=None):
                 first = False
             elif choice == "2":
                 if service.is_installed():
-                    console.print("Service removed." if service.uninstall() else "Could not remove the service.")
+                    console.print(service.uninstall(data_dir=install).sentence("Could not remove the service."))
                 elif ensure_setup(console, install):
                     ok = service.install(install)
                     console.print("Installed. It starts when your PC has been idle for "
