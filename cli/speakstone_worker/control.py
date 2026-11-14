@@ -19,6 +19,7 @@ class Control:
         self.update_version = None       # a newer version that is known but not installed yet
         self.drain_reason = None         # None, "pause" or "update": why the worker was asked to finish its job and leave
         self.drain_since = 0.0
+        self.drain_foreign = False       # the drain for an update is of a worker the app window started
         self.force_start_until = 0.0     # after an update: start a worker at once (even if the PC is not idle) until this time
         self.paused_until = None         # epoch seconds when a timed pause ends; None = until the user resumes
 

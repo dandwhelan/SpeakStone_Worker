@@ -1126,11 +1126,19 @@ def update_step(flow, control, st, runner, clock=time.time, drain_limit=DRAIN_LI
         if flow.prepare():                                  # failed: nothing was stopped
             control.update_version = flow.version
             return False
-    if runner.running:
+    # A worker started from the app window is not ours (`running` is False) but is just as busy. Until 1.2.17 the
+    # service did not wait for it and swapped the program under a job in hand (found 2026-11-14).
+    foreign = not runner.running and _busy(runner)
+    if runner.running or foreign:
         if control.drain_reason != "update":
-            runner.request_drain()
+            if foreign:
+                runner.drain_foreign()
+            else:
+                runner.request_drain()
             control.drain_reason, control.drain_since = "update", clock()
-            flow.log(f"update {flow.version} is ready; waiting for the job in hand to finish")
+            control.drain_foreign = foreign
+            flow.log(f"update {flow.version} is ready; waiting for the job in hand to finish"
+                     + (" (a worker started from the app window)" if foreign else ""))
         elif clock() - control.drain_since > drain_limit:
             runner.clear_drain()
             control.drain_reason = None
@@ -1138,8 +1146,10 @@ def update_step(flow, control, st, runner, clock=time.time, drain_limit=DRAIN_LI
             flow.give_up()
             control.update_version = None
         return False
-    was_working = control.drain_reason == "update"
+    # the window's worker is the window's to start again, so no resume marker for it
+    was_working = control.drain_reason == "update" and not getattr(control, "drain_foreign", False)
     control.drain_reason = None
+    control.drain_foreign = False
     control.status = control_mod.UPDATING
     flow.log(f"update {flow.version}: restarting as the new version")
     clear_latches(runner)                       # the new version may fix what stopped the worker
