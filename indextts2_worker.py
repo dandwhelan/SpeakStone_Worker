@@ -210,6 +210,81 @@ def recipe_fingerprint(row, revision, bitrate):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+HEADROOM_PEAK = 0.98      # a clip whose float peak is over this is scaled to exactly this (plain gain, no limiter)
+HEADROOM_PRESCALE = 0.5   # infer_v2 hands back int16 after clamp(32767*wav); the wave is halved first so peaks up to +6 dB survive
+_HEADROOM_HOOKED = False
+
+
+def headroom_enabled(environ=None):
+    """The clipping fix (owner 2026-11-16, ten loud lines A/B: the headroom take "is better"; "Yes, ship it"). ON by
+    default since worker 1.2.21; IDX2_HEADROOM=0 turns it off. Until then loud takes (shouts, deep voices) were clamped
+    at full scale twice inside the model, measured 0.01-0.8% of samples cut on takes peaking at 1.05-1.49x."""
+    env = os.environ if environ is None else environ
+    return (env.get("IDX2_HEADROOM") or "1").strip() != "0"
+
+
+def headroom_scale(arr, target=HEADROOM_PEAK):
+    """Whole-clip gain so the peak is at most `target`. Returns (array, gain). No limiter, no change when already under."""
+    peak = float(np.max(np.abs(arr))) if len(arr) else 0.0
+    if peak > target:
+        gain = target / peak
+        return (arr * gain).astype(np.float32), gain
+    return arr, 1.0
+
+
+def int16_to_float(w, prescale=1.0):
+    """The model's int16 output as float. With the headroom hook the model output was halved (prescale=0.5) before the
+    int16 clamp, so dividing it back recovers the float wave from BEFORE infer_v2's clamp (values over 1.0 intact)."""
+    arr = np.asarray(w).astype(np.float32) / 32768.0
+    return arr / prescale if prescale != 1.0 else arr
+
+
+def _bounds(args, kw):
+    lo = args[0] if len(args) > 0 else kw.get("min")
+    hi = args[1] if len(args) > 1 else kw.get("max")
+    return lo, hi
+
+
+def install_headroom_hook():
+    """Keep the loud peaks the model makes, without editing the installed package. Two clamps cut them:
+      1. BigVGAN's last step, torch.clamp(x, -1, 1) (its config has use_tanh_at_final=false): let that one call through;
+      2. infer_v2's torch.clamp(32767 * wav, -32767, 32767): halve the wave first (HEADROOM_PRESCALE).
+    Each module gets a thin torch proxy whose clamp changes only that exact call; every other attribute is the real torch.
+    The A/B of 2026-11-16 found that hooking only (2) changed nothing: (1) had already cut every peak to 1.0."""
+    global _HEADROOM_HOOKED
+    import indextts.infer_v2 as iv
+    import indextts.s2mel.modules.bigvgan.bigvgan as bv
+
+    def proxy(real, match, scale):
+        if getattr(real, "_idx2_headroom", False):
+            return real
+
+        class _TorchProxy:
+            _idx2_headroom = True
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def clamp(self, x, *args, **kw):
+                if match(*_bounds(args, kw)):
+                    if scale is None:
+                        return x
+                    x = x * scale
+                return real.clamp(x, *args, **kw)
+
+        return _TorchProxy()
+
+    bv.torch = proxy(bv.torch, lambda lo, hi: lo == -1.0 and hi == 1.0, None)
+    iv.torch = proxy(iv.torch, lambda lo, hi: lo == -32767.0 and hi == 32767.0, HEADROOM_PRESCALE)
+    _HEADROOM_HOOKED = True
+    return True
+
+
+def headroom_prescale():
+    """What the model output was scaled by before its int16 clamp: HEADROOM_PRESCALE once the hook is in, else 1."""
+    return HEADROOM_PRESCALE if _HEADROOM_HOOKED else 1.0
+
+
 def load_model(device):
     if not (MODEL_DIR / "config.yaml").exists():
         print(f"[FATAL] IndexTTS-2 weights not found in {MODEL_DIR} (set INDEXTTS2_DIR, or download "
@@ -250,6 +325,9 @@ def load_model(device):
             torch.cuda.empty_cache()
     except Exception as e:
         print(f"[warn] could not free the text-emotion model: {e}", file=sys.stderr)
+    if headroom_enabled():
+        install_headroom_hook()
+        print("[IndexTTS-2] headroom on: loud peaks kept, clip peak held at <= 0.98 before levelling", flush=True)
     return tts
 
 
@@ -381,12 +459,15 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                 text = row["cleaned_text"]
                 t_fin = time.time()
                 try:
-                    arr = np.asarray(w).astype(np.float32) / 32768.0
+                    arr = int16_to_float(w, headroom_prescale())
                     if arr.ndim > 1:
                         arr = arr.reshape(arr.shape[0], -1).mean(axis=1)
-                    peak = float(np.max(np.abs(arr))) if len(arr) else 0.0
-                    if peak > 1.0:
-                        arr = arr / peak * 0.98
+                    if headroom_prescale() != 1.0:
+                        arr, _gain = headroom_scale(arr)
+                    else:
+                        peak = float(np.max(np.abs(arr))) if len(arr) else 0.0
+                        if peak > 1.0:
+                            arr = arr / peak * 0.98
                     sf.write(str(wav_path), arr, sr)
                     level = rw.apply_post_fx_and_encode(wav_path, ogg_path, row.get("post_af", ""), bitrate=bitrate,
                                                         shout="!" in (text or ""))
@@ -418,7 +499,7 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                            "model_engine": ENGINE, "model_revision": revision, "generation_seed": seed,
                            "line_emotion": row.get("line_emotion", ""), "emo_vector": vec, "emo_alpha": EMO_ALPHA if vec else None,
                            "num_beams": 1 if USE_ACCEL else beams,   # the accel engine ignores num_beams
-                           "post_af": row.get("post_af", ""), "bitrate": bitrate,
+                           "post_af": row.get("post_af", ""), "bitrate": bitrate, "headroom": headroom_prescale() != 1.0,
                            "measured_lufs": (level or {}).get("measured_lufs"), "level": (level or {}).get("level"),
                            "level_recipe": (level or {}).get("level_recipe"), "duration_sec": round(dur, 3),
                            "gen_time_sec": round(gen, 3), "rtf": round(gen / dur, 3) if dur > 0 else 0.0,
