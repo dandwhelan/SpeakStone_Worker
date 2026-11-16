@@ -170,6 +170,15 @@ def _ffmpeg(args, timeout=90):
     return _run_with_retry(["ffmpeg", "-nostdin", "-hide_banner", "-y"] + args, timeout=timeout)
 
 
+def codec_args(bitrate):
+    """ffmpeg codec args for the clip file. "lossless" (owner 2026-11-16, "32k once sounds the same ... 1 pass, not 2")
+    writes FLAC under the same .ogg name (plain FLAC: libsndfile, which the quality gate uses, cannot read FLAC in Ogg): the pipeline stitches, levels and pads it losslessly and
+    encodes it to 32k Vorbis ONCE, at install. Anything else ("32k") is a Vorbis bitrate, as before."""
+    if str(bitrate).lower() == "lossless":
+        return ["-c:a", "flac", "-sample_fmt", "s16", "-f", "flac"]
+    return ["-c:a", "libvorbis", "-b:a", str(bitrate)]
+
+
 def apply_post_fx_and_encode(in_wav, out_ogg, post_af=None, bitrate="32k", shout=False):
     """
     Trim leading silence, apply the profile's filters (pitch, formant, bass), level the loudness (see TARGET_LUFS
@@ -208,8 +217,8 @@ def apply_post_fx_and_encode(in_wav, out_ogg, post_af=None, bitrate="32k", shout
         if not filters:                     # inside the window, or not measurable: no gain, but the same peak limit
             filters.append(f"alimiter=limit={LIMIT_LINEAR}:level=false")
         args = ["-i", mid] + (["-af", ",".join(filters)] if filters else [])
-        r = _ffmpeg(args + ["-c:a", "libvorbis", "-b:a", str(bitrate), "-ar", str(OUTPUT_SAMPLE_RATE),
-                            "-ac", str(OUTPUT_CHANNELS), str(out_ogg)])
+        r = _ffmpeg(args + codec_args(bitrate) + ["-ar", str(OUTPUT_SAMPLE_RATE), "-ac", str(OUTPUT_CHANNELS),
+                                                  str(out_ogg)])
         if r.returncode != 0:
             raise RuntimeError(f"FFmpeg encoding failed: {r.stderr[-500:]}")
     finally:

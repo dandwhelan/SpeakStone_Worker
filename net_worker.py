@@ -45,7 +45,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.2.19"
+WORKER_VERSION = "1.2.20"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
@@ -74,7 +74,7 @@ BACKOFF_START = 5
 BACKOFF_CAP = 300
 VRAM_POLL_SECONDS = 30
 GPU_FATAL_WAIT_SECONDS = 60
-MAX_RESULT_BYTES = 4 * 1024 * 1024
+MAX_RESULT_BYTES = 16 * 1024 * 1024   # 4 MB until 1.2.20; a lossless clip is ~8x a 32k one
 MAX_REF_BYTES = 20 * 1024 * 1024
 MAX_RESUME = 8
 YIELD_CHECK_SECONDS = 10    # spec 12a, yield
@@ -90,7 +90,7 @@ GPU_UNSAFE_MARKER = "GPU state is unsafe"
 OFFLINE_ENV = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")      # never passed on: model files may always be fetched
 KEY_RE = re.compile(r"^sswk_[A-Za-z0-9_-]{43}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
-BITRATE_RE = re.compile(r"^[0-9]{2,3}k$")
+BITRATE_RE = re.compile(r"^([0-9]{2,3}k|lossless)$")   # "lossless": FLAC, encoded once at install (1.2.20)
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 LIVE_KEYS = ("gpu_util", "gpu_mem_used_mib", "vram_free_mib", "session_started_at", "session_clips",

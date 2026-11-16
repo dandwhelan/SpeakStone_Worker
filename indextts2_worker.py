@@ -194,12 +194,19 @@ def model_revision():
     return f"{MODEL_REPO}@cfg-{h}"
 
 
+def fp_bitrate(bitrate):
+    """"lossless" counts as 32k: the clip that ships is the same 32k Vorbis, encoded once at install instead of here
+    (2026-11-16), so a clip made either way is not remade."""
+    b = str(bitrate).lower()
+    return "32k" if b == "lossless" else b
+
+
 def recipe_fingerprint(row, revision, bitrate):
     vec = emotion_vector(row)
     payload = "|".join(str(x) for x in (
         row["text_hash"], row["profile_key"], row["canonical_reference_clip"], ENGINE, revision,
         json.dumps(vec) if vec else "", EMO_ALPHA if vec else "", rw.compute_generation_seed(row),
-        row.get("post_af", "") or "", str(bitrate).lower(), rw.OUTPUT_SAMPLE_RATE, rw.OUTPUT_CHANNELS))
+        row.get("post_af", "") or "", fp_bitrate(bitrate), rw.OUTPUT_SAMPLE_RATE, rw.OUTPUT_CHANNELS))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
