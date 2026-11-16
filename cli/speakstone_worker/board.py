@@ -50,7 +50,7 @@ def menu_screen(service_installed=False, update_version=None, label=""):
     t.append(f"  {APP_NAME} {__version__}" + (f" - {label}" if label else "") + "\n\n", style=DIM)
     items = [("1", "Start now", ""), ("2", "Uninstall the service" if service_installed else "Install as a service",
                                       "" if service_installed else "(runs when your PC is idle)"),
-             ("3", "Settings", "")]
+             ("3", "Settings", ""), ("4", "Send my captured WoW text", "(quest, gossip and book text with no voice yet)")]
     if update_version:
         items.append(("U", "Update now", f"(version {update_version} is available)"))
     items.append(("Q", "Quit", ""))

@@ -15,7 +15,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.live import Live
 
-from . import (APP_NAME, __version__, board, identity, locking, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
+from . import (APP_NAME, __version__, board, identity, wowtext, locking, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
                stats, tray as tray_mod, uninstall, update)
 from .keys import KeyReader, drain
 from .runner import WorkerGroup, install_close_handlers
@@ -515,6 +515,9 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
         console.print(f"  [{board.GOLD}][8][/] Start making lines when the app opens: "
                       f"[bold]{'on' if st['start_on_open'] else 'off'}[/]")
         console.print(f"  [{board.GOLD}][9][/] Update now (this is version [bold]{__version__}[/])")
+        console.print(f"  [{board.GOLD}][W][/] Send my captured WoW text automatically: "
+                      f"[bold]{'on' if st['send_wow_text'] else 'off'}[/]")
+        console.print(f"  [{board.GOLD}][F][/] WoW folder, if it is not found by itself: [bold]{st['wow_folder'] or 'look for it'}[/]")
         console.print(f"  [{board.GOLD}][B][/] Back")
         with KeyReader() as keys:
             k = keys.wait()
@@ -524,6 +527,16 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             time.sleep(3)
         elif k == "8":
             st["start_on_open"] = not st["start_on_open"]
+        elif k == "w":
+            st["send_wow_text"] = not st["send_wow_text"]
+        elif k == "f":
+            console.show_cursor(True)
+            v = input("WoW folder (for example D:\Games\World of Warcraft), blank to look for it: ").strip().strip('"')
+            if not v or os.path.isdir(v):
+                st["wow_folder"] = v
+            else:
+                console.print("That folder does not exist.")
+                time.sleep(2)
         elif k == "7":
             st["auto_update"] = not st["auto_update"]
         elif k == "6":
@@ -554,6 +567,27 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             time.sleep(2)
         elif k in ("b", "q", "\x1b"):
             return
+
+
+def send_wow_text_now(console, install, st, sender=wowtext.collect_and_send, wait=input):
+    """Menu [4]: read the SpeakStone add-on's saved text from this PC's WoW folder and send what is new."""
+    key = identity.read_key(install)
+    if not key:
+        console.print("This PC is not set up yet - choose Start now first.")
+        time.sleep(2.5)
+        return None
+    console.print("Looking in your WoW folder for text the SpeakStone add-on captured "
+                  "(WoW saves it when you log out or type /reload)...")
+    summary = sender(install, paths.api_base(), key, st["wow_folder"], say=console.print)
+    if summary["files"]:
+        console.print(f"Done: {summary['entries']} captured entries sent"
+                      + (f", {summary['skipped']} already sent before" if summary["skipped"] else "") + ".")
+    console.show_cursor(True)
+    try:
+        wait("Press Enter to go back to the menu. ")
+    except EOFError:
+        pass
+    return summary
 
 
 def rename_flow(console, install, ask=input, renamer=identity.rename):
@@ -1396,6 +1430,8 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
         return 2
     setup.sync_worker_files(install, paths.resource_dir())
     log = lambda text: log_background_error(install, text)
+    # Settings [W]: send the add-on's captured text from WoW now and then (does nothing while the setting is off)
+    wowtext.start_auto(install, st, paths.api_base, lambda: identity.read_key(install), log=log)
     flow = flow or update.UpdateFlow(log=log, app_exe=paths.app_exe())
     flow.args = ["--background"]               # after an update the new process carries on as the service
     update.cleanup_old(flow.exe)

@@ -1,7 +1,9 @@
 # SpeakStone Worker (command line)
 
 Run: `SpeakStoneWorker.exe` (Windows) or `./run.sh` / `python -m speakstone_worker` (Linux, `pip install rich`).
-Menu: [1] Start now, [2] Install as a service (runs when your PC is idle), [3] Settings, [Q] Quit.
+Menu: [1] Start now, [2] Install as a service (runs when your PC is idle), [3] Settings, [4] Send my captured WoW text, [Q] Quit.
+
+**Send my captured WoW text** (menu [4]; Settings [W] makes the service do it every few hours, off by default; [F] sets the WoW folder if it is not found). Reads the SpeakStone add-on's saved variables (`WTFAccount*SavedVariablesSpeakStone_Main.lua` and `SpeakStone_Forever_Main.lua`) without changing them and sends the captured quest, gossip and book text to the site (`/api/worker/harvest`), so nobody has to paste the in-game export. WoW writes that file only on logout or `/reload`. What was sent is remembered in `wowtext_sent.json`; an entry goes again only when the add-on has captured more of it.
 First run sets itself up (about 20 GB free, 8 GB graphics card), joins the queue automatically and needs no key.
 Everything lives in `%LOCALAPPDATA%\SpeakStoneWorker` (Linux: `~/.local/share/speakstone-worker`).
 `SPEAKSTONE_API_BASE` overrides the site URL (testing). Tests: `pytest cli/tests`. Build: `pyinstaller SpeakStoneWorker.spec`.

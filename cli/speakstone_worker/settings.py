@@ -18,6 +18,8 @@ DEFAULTS = {
     "paused_until": 0,          # epoch seconds: a timed pause from the tray, kept so it survives a restart; 0 = none
     "start_on_open": True,      # opening the app starts making lines at once (the menu is one key away)
     "auto_update": True,        # fetch and install a newer release by itself; off = only say one is available
+    "send_wow_text": False,     # the service sends the add-on's captured quest/gossip/book text from WoW (wowtext.py)
+    "wow_folder": "",           # WoW install folder, when it is not in a usual place; blank = look for it
 }
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
