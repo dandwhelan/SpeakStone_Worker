@@ -328,7 +328,7 @@ def test_idle_and_max_jobs_recycle(tmp_path, monkeypatch):
         assert w.run_synth(make_ctx(w, JOB1)) == 0 and w.engine_alive()
         w.cycle()                                                      # empty queue, engine still fresh
         assert w.engine_alive()
-        w.engine.last_used -= nw.ENGINE_IDLE_SECONDS + 1
+        w.engine.last_used -= w.engine.idle_seconds + 1
         w.cycle()
         assert not w.engine_alive()
         assert any("reason=idle" in e for e in events(tmp_path, "engine"))

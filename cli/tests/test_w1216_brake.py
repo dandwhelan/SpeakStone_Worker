@@ -38,7 +38,7 @@ def test_two_jobs_with_no_line_made_stop(tmp_path, monkeypatch):
 
 def test_five_mixed_failures_in_a_row_stop(tmp_path, monkeypatch):
     w, _ = make_worker(tmp_path, monkeypatch, FakeApi())
-    for reason, nm in (("stalled", False), ("upload_failed", False), ("line_failed", True), ("worker_error", False)):
+    for reason, nm in (("stalled", False), ("gpu_fatal", False), ("line_failed", True), ("worker_error", False)):
         failing(w, reason, nm)
     with pytest.raises(nw.ExitRun) as e:
         failing(w, "stalled")
@@ -48,7 +48,7 @@ def test_five_mixed_failures_in_a_row_stop(tmp_path, monkeypatch):
 def test_a_non_empty_failure_between_two_empty_ones_breaks_the_empty_run(tmp_path, monkeypatch):
     w, _ = make_worker(tmp_path, monkeypatch, FakeApi())
     failing(w, none_made=True)
-    failing(w, "upload_failed")
+    failing(w, "gpu_fatal")
     failing(w, none_made=True)           # not two empty jobs in a row, and only three failures in all: no stop
 
 

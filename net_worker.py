@@ -60,6 +60,9 @@ RETRY_AFTER_CAP = 300     # longest wait a 429 Retry-After can ask for
 # this long with no job, and always when local GPU work wants the card, so the memory is not held for ever.
 ENGINE_MAX_JOBS = 50
 ENGINE_IDLE_SECONDS = 300
+# With no yield lock the GPU is this worker's alone, so there is nothing to give back for: a model reload costs minutes,
+# so an idle engine is kept this long (a yield_lock config, where another program shares the card, keeps the 300 s).
+ENGINE_IDLE_FREE_SECONDS = 1800
 # A frozen engine keeps its job (the heartbeat keeps renewing the lease) for hours. No new clip, no new line of engine
 # output and no ready/done marker for this long and the engine is killed and the job goes back to the queue. Loading
 # the model before the first clip can take several minutes, so the clock starts at run start and this covers it.
@@ -87,6 +90,7 @@ HELD_DIR = "_held_qc"
 QC_LOG = "_qc_held.jsonl"
 PROV_LOG = "generation_provenance.jsonl"
 GPU_UNSAFE_MARKER = "GPU state is unsafe"
+OOM_MARKERS = ("CUDA out of memory", "OutOfMemoryError")   # in the engine's log: the card was too full for the job
 OFFLINE_ENV = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")      # never passed on: model files may always be fetched
 KEY_RE = re.compile(r"^sswk_[A-Za-z0-9_-]{43}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -218,10 +222,18 @@ def last_error_line(log_path, offset=0, max_bytes=65536):
     return ""
 
 
+# Failures whose cause is the site or the network, not this PC: they must not count toward the brake that stops the
+# worker for good (a site outage used to latch CANNOT_MAKE_LINES after five failed uploads). gpu_oom is a capacity
+# problem: the job goes back to the queue for another worker.
+SITE_FAULT_REASONS = ("upload_failed", "ref_download", "net_error")
+NOT_COUNTED_REASONS = SITE_FAULT_REASONS + ("gpu_oom",)
+
+
 class JobFail(Exception):
-    def __init__(self, reason, message, retryable, delete_dir):
+    def __init__(self, reason, message, retryable, delete_dir, site_fault=None):
         super().__init__(message)
         self.reason, self.message, self.retryable, self.delete_dir = reason, message, retryable, delete_dir
+        self.site_fault = reason in SITE_FAULT_REASONS if site_fault is None else bool(site_fault)
 
 
 # ----------------------------------------------------------------------------------------------- small helpers
@@ -1147,6 +1159,7 @@ class JobCtx:
         self.started_at = utc_iso()
         self.n = len(payload.get("lines", [])) if isinstance(payload, dict) and isinstance(payload.get("lines"), list) else 0
         self.worker = None
+        self.oom_tries = 0           # engine restarts after "out of memory" in this job (one is allowed)
         self.grace_until = None      # set once every line is made: from then on only a lost lease may abort
         self.load_s = 0.0            # engine start to ready, summed over this job's runs (0 when a loaded one was reused)
         self.synth_s = 0.0           # time spent in run_synth, summed over this job's runs
@@ -1283,8 +1296,9 @@ class EngineHost:
     "[JOB-DONE] rc=<n>" after each job. Any way of stopping a job kills the whole process tree and marks the host
     dead; the next job starts a fresh one."""
 
-    def __init__(self, cmd, env_fn, cwd, max_jobs=ENGINE_MAX_JOBS):
+    def __init__(self, cmd, env_fn, cwd, max_jobs=ENGINE_MAX_JOBS, idle_seconds=ENGINE_IDLE_SECONDS):
         self.cmd, self.env_fn, self.cwd, self.max_jobs = list(cmd), env_fn, str(cwd), max_jobs
+        self.idle_seconds = idle_seconds
         self.proc = None
         self.jobs = 0
         self.last_used = time.monotonic()
@@ -1388,7 +1402,7 @@ class EngineHost:
 
     def needs_recycle(self, now=None):
         now = time.monotonic() if now is None else now
-        return self.alive() and (self.jobs >= self.max_jobs or now - self.last_used >= ENGINE_IDLE_SECONDS)
+        return self.alive() and (self.jobs >= self.max_jobs or now - self.last_used >= self.idle_seconds)
 
     def kill(self):
         """Kill the engine and everything it started (ffmpeg included) and mark the host dead."""
@@ -1440,6 +1454,7 @@ class Worker:
         self.install_signals = install_signals
         self.stop_event = threading.Event()
         self.backoff = Backoff()
+        self.soft_backoff = Backoff()    # failures that are the site, the network or the card's capacity: a wait, no count
         self.idle_delay = IDLE_BASE_SECONDS
         self.sleep_impl = self._real_sleep       # tests replace this
         self.model_hash = ""
@@ -1486,7 +1501,9 @@ class Worker:
 
     def engine_host(self):
         if getattr(self, "engine", None) is None:
-            self.engine = EngineHost(self.serve_command(), self.synth_env, os.path.abspath(str(self.work)))
+            idle = ENGINE_IDLE_SECONDS if getattr(self.cfg, "yield_lock", "") else ENGINE_IDLE_FREE_SECONDS
+            self.engine = EngineHost(self.serve_command(), self.synth_env, os.path.abspath(str(self.work)),
+                                     idle_seconds=idle)
         return self.engine
 
     # ---- stop / sleep
@@ -1920,6 +1937,10 @@ class Worker:
             after_wait = self.after_fail(ctx, f)
         except Drained:
             raise
+        except NetError as e:
+            kill_tree(ctx.proc)
+            self.log.event("error", job_id, where="net", error=describe_exc(e))
+            after_wait = self.after_fail(ctx, JobFail("net_error", "the site or the network did not answer", True, False))
         except Exception as e:
             # Anything else used to escape: no fail was sent, the engine kept running and the job stayed leased with its
             # folder kept for a resume, so a job that always crashed the worker came back for ever (2026-11-14 review).
@@ -1938,7 +1959,14 @@ class Worker:
     def after_fail(self, ctx, f):
         """Send a job's failure to the site and apply the brake. -> seconds to wait before the next job."""
         try:
-            self.send_fail(ctx, f)
+            if f.reason == "gpu_oom":
+                # A capacity problem, not a defect of the job: hand it back exactly like a stop ("released", which
+                # costs the job no attempt) so another worker takes it, and never count it toward the brake.
+                self.log.event("fail", ctx.job_id, reason=f.reason, retryable=True, message=f.message[:200])
+                self.release(ctx, "not enough GPU memory on this PC")
+                self.delete_job_dir(ctx.job_id)
+            else:
+                self.send_fail(ctx, f)
         except Stop:
             self.release(ctx)
             raise
@@ -1949,6 +1977,11 @@ class Worker:
         is not this PC's fault or is the user's choice (reason "released") counts for nothing."""
         if f.reason == "released":
             return 0
+        if f.reason in NOT_COUNTED_REASONS or getattr(f, "site_fault", False):
+            # the site, the network or the card's capacity: not a broken PC. Back off (5, 10 ... 300 s) and try again
+            # with the next job; the count that stops the worker is left as it was.
+            wait = self.soft_backoff.next()
+            return max(wait, GPU_FATAL_WAIT_SECONDS if f.reason == "gpu_oom" else 0)
         self._failed_jobs = getattr(self, "_failed_jobs", 0) + 1
         none_made = bool(getattr(f, "none_made", False))
         self._dead_jobs = getattr(self, "_dead_jobs", 0) + 1 if none_made else 0
@@ -2033,6 +2066,7 @@ class Worker:
             ctx.synth_s += time.time() - t_synth
             st = self.scan(ctx)
             unsafe = self.log_has(log_path, offset, GPU_UNSAFE_MARKER)
+            oom = self.log_has(log_path, offset, OOM_MARKERS)
             err = last_error_line(log_path, offset) if rc else ""
             if err:
                 last_err = err
@@ -2046,6 +2080,17 @@ class Worker:
                 break
             if unsafe:
                 raise JobFail("gpu_fatal", "GPU state is unsafe", True, False)
+            if oom:
+                # Out of memory: a fresh engine on a free card may do it. One retry of the lines still to make (it does
+                # not count as one of the MAX_RERUNS); a second time the card is too small or too busy for this job.
+                if ctx.oom_tries >= 1:
+                    raise JobFail("gpu_oom", "the GPU ran out of memory", True, True)
+                ctx.oom_tries += 1
+                self.log.event("oom", ctx.job_id, run=runs, todo=len(todo))
+                self.engine_shutdown("oom")
+                self.wait_for_vram()
+                ctx.check()
+                continue
             if runs > MAX_RERUNS:
                 break
             ctx.check()
@@ -2072,7 +2117,8 @@ class Worker:
                 continue
             if status == 422 and code in ("object_missing", "object_size_mismatch"):
                 raise JobFail("upload_failed", f"complete refused: {code}", True, False)
-            raise JobFail("other", f"complete answered HTTP {status} {code}"[:200], status == 422, status != 422)
+            raise JobFail("other", f"complete answered HTTP {status} {code}"[:200], status == 422, status != 422,
+                          site_fault=status >= 500)
         ok_n = sum(1 for v in st.values() if v["kind"] == "ok")
         held_n = sum(1 for v in st.values() if v["kind"] == "held")
         job_audio = sum(float(v.get("duration_sec") or 0) for v in st.values())
@@ -2084,15 +2130,19 @@ class Worker:
         # (0 when the kept engine was reused; not known in one-process-per-job mode, where it is inside gen_s)
         load_s = round(ctx.load_s, 1) if self.engine_keep() else None
         gen_s = round(max(0.0, ctx.synth_s - (ctx.load_s if self.engine_keep() else 0.0)), 1)
+        # Words per hour of synthesis alone (model load left out). Logged here only: LIVE_KEYS is a whitelist the site
+        # mirrors, and an unknown key in a heartbeat could get it refused, so it is not sent.
+        gen_wph = round(job_words / gen_s * 3600) if gen_s > 0 else 0     # 0: too quick to measure
         self._dead_jobs = 0
         self._failed_jobs = 0
+        self.soft_backoff.ok()
         try:
             (self.work / BROKEN_FILE).unlink()
         except OSError:
             pass
         self.log.event("complete", ctx.job_id, ok=ok_n, held=held_n, seconds=round(time.time() - t_run, 1),
                        already=data.get("already"), words=job_words, audio=round(job_audio), load_s=load_s,
-                       gen_s=gen_s)
+                       gen_s=gen_s, gen_wph=gen_wph)
         self.delete_job_dir(ctx.job_id)
 
     # ---- refs (8.3 step 5)
@@ -2217,10 +2267,13 @@ class Worker:
 
     @staticmethod
     def log_has(path, offset, needle):
+        """True when the log, from offset on, holds the text (or any of the texts, when a tuple is given)."""
+        needles = (needle,) if isinstance(needle, str) else tuple(needle)
         try:
             with open(path, "rb") as f:
                 f.seek(offset)
-                return needle in f.read().decode("utf-8", "replace")
+                text = f.read().decode("utf-8", "replace")
+            return any(n in text for n in needles)
         except OSError:
             return False
 
