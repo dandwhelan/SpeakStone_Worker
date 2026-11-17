@@ -46,7 +46,7 @@ def test_exit_7_latches_until_the_person_acts(tmp_path):
     sp.procs[0].code = 7
     assert tick(g, gates) == "wait"
     assert (tmp_path / "work" / cli.LATCH_FILE).exists()
-    clock[0] += 24 * 3600
+    clock[0] += 5 * 3600                       # under cli.LATCH_RETRY_SECONDS (6 h): still latched
     assert tick(g, gates) == "wait" and len(sp.procs) == 1
     # a service restart forgets the gates, the file still holds
     assert tick(g, cli.RestartGates(lambda: clock[0])) == "wait" and len(sp.procs) == 1

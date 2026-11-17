@@ -682,6 +682,7 @@ NO_RESTART_CODES = (3, 4, 5, 6, 7)
 NO_RESTART_WAIT = 30 * 60
 BUSY_WAIT = 60                  # code 6: another window holds this key; it may close in seconds, so look again soon
 LATCH_CODE = 7                  # "cannot make lines": never retried by itself, only when the person acts
+LATCH_RETRY_SECONDS = 6 * 3600  # a latch older than this is lifted once by itself: a site or network outage ends without anyone acting
 LATCH_FILE = "CANNOT_MAKE_LINES"   # in the worker's work folder: the worker writes it on exit 7 and removes it after a job
 CRASH_BACKOFF_FIRST = 30
 CRASH_BACKOFF_MAX = 10 * 60
@@ -707,6 +708,7 @@ class RestartGate:
         self.crashes = 0
         self.seen_running = False
         self._mem_latch = False
+        self._latched_at = None     # when this process saw the latch set; None for one found on disk after a restart
 
     @property
     def latch_path(self):
@@ -714,11 +716,23 @@ class RestartGate:
 
     def latched(self):
         p = self.latch_path
-        return self._mem_latch or bool(p and p.exists())
+        on_disk = bool(p and p.exists())
+        if not (self._mem_latch or on_disk):
+            return False
+        since = self._latched_at
+        if since is None and on_disk:
+            try:
+                since = p.stat().st_mtime       # survives a service restart (the gate's own clock is the same epoch)
+            except OSError:
+                since = None
+        if since is not None and self.clock() - since >= LATCH_RETRY_SECONDS:
+            self.release()                      # one more try; if the worker breaks again, exit 7 latches it again
+            return False
+        return True
 
     def release(self):
-        """The person acted: forget every failure."""
-        self._mem_latch, self.until, self.crashes = False, 0.0, 0
+        """The person acted (or the latch ran out): forget every failure."""
+        self._mem_latch, self.until, self.crashes, self._latched_at = False, 0.0, 0, None
         p = self.latch_path
         try:
             if p:
@@ -741,6 +755,7 @@ class RestartGate:
             self.crashes = 0
             return
         if exit_code == LATCH_CODE:
+            self._latched_at = self.clock()
             p = self.latch_path
             try:
                 if not p:
@@ -809,13 +824,13 @@ def latched_now(runner, gate=None):
     """True when an active worker is held back by exit 7 (a file or this process's own latch)."""
     for r in _active_members(runner):
         wd = getattr(r, "work_dir", None)
+        if gate is not None and hasattr(gate, "of") and gate.of(r).latched():
+            return True                  # asked first: a latch past LATCH_RETRY_SECONDS lifts itself here (file removed)
         try:
             if wd and (Path(wd) / LATCH_FILE).exists():
                 return True
         except OSError:
             pass
-        if gate is not None and hasattr(gate, "of") and gate.of(r).latched():
-            return True
     return False
 
 
