@@ -1,0 +1,121 @@
+<svg class="rich-terminal" viewBox="0 0 1629 440.4" xmlns="http://www.w3.org/2000/svg">
+    <!-- Generated with Rich https://www.textualize.io -->
+    <style>
+
+    @font-face {
+        font-family: "Fira Code";
+        src: local("FiraCode-Regular"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff2/FiraCode-Regular.woff2") format("woff2"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff/FiraCode-Regular.woff") format("woff");
+        font-style: normal;
+        font-weight: 400;
+    }
+    @font-face {
+        font-family: "Fira Code";
+        src: local("FiraCode-Bold"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff2/FiraCode-Bold.woff2") format("woff2"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff/FiraCode-Bold.woff") format("woff");
+        font-style: bold;
+        font-weight: 700;
+    }
+
+    .terminal-3430482300-matrix {
+        font-family: Fira Code, monospace;
+        font-size: 20px;
+        line-height: 24.4px;
+        font-variant-east-asian: full-width;
+    }
+
+    .terminal-3430482300-title {
+        font-size: 18px;
+        font-weight: bold;
+        font-family: arial;
+    }
+
+    .terminal-3430482300-r1 { fill: #c5c8c6 }
+.terminal-3430482300-r2 { fill: #e9bb4d }
+.terminal-3430482300-r3 { fill: #868887 }
+.terminal-3430482300-r4 { fill: #c5c8c6;font-weight: bold }
+    </style>
+
+    <defs>
+    <clipPath id="terminal-3430482300-clip-terminal">
+      <rect x="0" y="0" width="1609.3999999999999" height="389.4" />
+    </clipPath>
+    <clipPath id="terminal-3430482300-line-0">
+    <rect x="0" y="1.5" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-1">
+    <rect x="0" y="25.9" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-2">
+    <rect x="0" y="50.3" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-3">
+    <rect x="0" y="74.7" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-4">
+    <rect x="0" y="99.1" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-5">
+    <rect x="0" y="123.5" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-6">
+    <rect x="0" y="147.9" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-7">
+    <rect x="0" y="172.3" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-8">
+    <rect x="0" y="196.7" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-9">
+    <rect x="0" y="221.1" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-10">
+    <rect x="0" y="245.5" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-11">
+    <rect x="0" y="269.9" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-12">
+    <rect x="0" y="294.3" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-13">
+    <rect x="0" y="318.7" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-3430482300-line-14">
+    <rect x="0" y="343.1" width="1610.4" height="24.65"/>
+            </clipPath>
+    </defs>
+
+    <rect fill="#292929" stroke="rgba(255,255,255,0.35)" stroke-width="1" x="1" y="1" width="1627" height="438.4" rx="8"/><text class="terminal-3430482300-title" fill="#c5c8c6" text-anchor="middle" x="813" y="27">SpeakStone&#160;Worker&#160;1.2.23</text>
+            <g transform="translate(26,22)">
+            <circle cx="0" cy="0" r="7" fill="#ff5f57"/>
+            <circle cx="22" cy="0" r="7" fill="#febc2e"/>
+            <circle cx="44" cy="0" r="7" fill="#28c840"/>
+            </g>
+        
+    <g transform="translate(9, 41)" clip-path="url(#terminal-3430482300-clip-terminal)">
+    
+    <g class="terminal-3430482300-matrix">
+    <text class="terminal-3430482300-r1" x="1610.4" y="20" textLength="12.2" clip-path="url(#terminal-3430482300-line-0)">
+</text><text class="terminal-3430482300-r2" x="0" y="44.4" textLength="97.6" clip-path="url(#terminal-3430482300-line-1)">SETTINGS</text><text class="terminal-3430482300-r3" x="122" y="44.4" textLength="73.2" clip-path="url(#terminal-3430482300-line-1)">(part)</text><text class="terminal-3430482300-r1" x="1610.4" y="44.4" textLength="12.2" clip-path="url(#terminal-3430482300-line-1)">
+</text><text class="terminal-3430482300-r2" x="24.4" y="68.8" textLength="36.6" clip-path="url(#terminal-3430482300-line-2)">[W]</text><text class="terminal-3430482300-r1" x="61" y="68.8" textLength="512.4" clip-path="url(#terminal-3430482300-line-2)">&#160;Send&#160;my&#160;captured&#160;WoW&#160;text&#160;automatically:&#160;</text><text class="terminal-3430482300-r4" x="573.4" y="68.8" textLength="24.4" clip-path="url(#terminal-3430482300-line-2)">on</text><text class="terminal-3430482300-r1" x="1610.4" y="68.8" textLength="12.2" clip-path="url(#terminal-3430482300-line-2)">
+</text><text class="terminal-3430482300-r2" x="24.4" y="93.2" textLength="36.6" clip-path="url(#terminal-3430482300-line-3)">[A]</text><text class="terminal-3430482300-r1" x="61" y="93.2" textLength="488" clip-path="url(#terminal-3430482300-line-3)">&#160;Keep&#160;my&#160;SpeakStone&#160;add-ons&#160;up&#160;to&#160;date:&#160;</text><text class="terminal-3430482300-r4" x="549" y="93.2" textLength="24.4" clip-path="url(#terminal-3430482300-line-3)">on</text><text class="terminal-3430482300-r1" x="1610.4" y="93.2" textLength="12.2" clip-path="url(#terminal-3430482300-line-3)">
+</text><text class="terminal-3430482300-r2" x="24.4" y="117.6" textLength="36.6" clip-path="url(#terminal-3430482300-line-4)">[U]</text><text class="terminal-3430482300-r1" x="61" y="117.6" textLength="622.2" clip-path="url(#terminal-3430482300-line-4)">&#160;Update&#160;my&#160;SpeakStone&#160;add-ons&#160;now&#160;(close&#160;WoW&#160;first)</text><text class="terminal-3430482300-r1" x="1610.4" y="117.6" textLength="12.2" clip-path="url(#terminal-3430482300-line-4)">
+</text><text class="terminal-3430482300-r2" x="24.4" y="142" textLength="36.6" clip-path="url(#terminal-3430482300-line-5)">[L]</text><text class="terminal-3430482300-r1" x="61" y="142" textLength="390.4" clip-path="url(#terminal-3430482300-line-5)">&#160;Show&#160;what&#160;was&#160;sent&#160;(upload&#160;log)</text><text class="terminal-3430482300-r1" x="1610.4" y="142" textLength="12.2" clip-path="url(#terminal-3430482300-line-5)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="166.4" textLength="170.8" clip-path="url(#terminal-3430482300-line-6)">What&#160;it&#160;found:</text><text class="terminal-3430482300-r1" x="1610.4" y="166.4" textLength="12.2" clip-path="url(#terminal-3430482300-line-6)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="190.8" textLength="1171.2" clip-path="url(#terminal-3430482300-line-7)">Retail&#160;(_retail_):&#160;SpeakStone&#160;6.1.3,&#160;16&#160;voice&#160;packs&#160;&#160;&#160;[C:\Program&#160;Files&#160;(x86)\World&#160;of&#160;Warcraft]</text><text class="terminal-3430482300-r1" x="1610.4" y="190.8" textLength="12.2" clip-path="url(#terminal-3430482300-line-7)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="215.2" textLength="585.6" clip-path="url(#terminal-3430482300-line-8)">&#160;&#160;&#160;&#160;ACCOUNT#1:&#160;22&#160;captured,&#160;0&#160;waiting&#160;to&#160;be&#160;sent</text><text class="terminal-3430482300-r1" x="1610.4" y="215.2" textLength="12.2" clip-path="url(#terminal-3430482300-line-8)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="239.6" textLength="1329.8" clip-path="url(#terminal-3430482300-line-9)">WoW&#160;Forever&#160;(_forever_):&#160;SpeakStone&#160;Forever&#160;6.1.3,&#160;4&#160;voice&#160;packs&#160;&#160;&#160;[C:\Program&#160;Files&#160;(x86)\World&#160;of&#160;Warcraft]</text><text class="terminal-3430482300-r1" x="1610.4" y="239.6" textLength="12.2" clip-path="url(#terminal-3430482300-line-9)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="264" textLength="573.4" clip-path="url(#terminal-3430482300-line-10)">&#160;&#160;&#160;&#160;ACCOUNT#1:&#160;3&#160;captured,&#160;1&#160;waiting&#160;to&#160;be&#160;sent</text><text class="terminal-3430482300-r1" x="1610.4" y="264" textLength="12.2" clip-path="url(#terminal-3430482300-line-10)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="288.4" textLength="353.8" clip-path="url(#terminal-3430482300-line-11)">Last&#160;looked:&#160;2026-11-24&#160;21:27</text><text class="terminal-3430482300-r1" x="1610.4" y="288.4" textLength="12.2" clip-path="url(#terminal-3430482300-line-11)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="312.8" textLength="1403" clip-path="url(#terminal-3430482300-line-12)">Last&#160;upload:&#160;2026-11-24&#160;21:13&#160;&#160;_forever_&#160;/&#160;ACCOUNT#1:&#160;sent&#160;2&#160;entries,&#160;the&#160;site&#160;took&#160;1&#160;new&#160;lines&#160;(1&#160;already&#160;known)&#160;&#160;</text><text class="terminal-3430482300-r1" x="1610.4" y="312.8" textLength="12.2" clip-path="url(#terminal-3430482300-line-12)">
+</text><text class="terminal-3430482300-r3" x="0" y="337.2" textLength="439.2" clip-path="url(#terminal-3430482300-line-13)">https://speakstone.beanw.co.uk/s/...</text><text class="terminal-3430482300-r1" x="1610.4" y="337.2" textLength="12.2" clip-path="url(#terminal-3430482300-line-13)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="361.6" textLength="366" clip-path="url(#terminal-3430482300-line-14)">Add-ons&#160;(_retail_):&#160;up&#160;to&#160;date</text><text class="terminal-3430482300-r1" x="1610.4" y="361.6" textLength="12.2" clip-path="url(#terminal-3430482300-line-14)">
+</text><text class="terminal-3430482300-r3" x="73.2" y="386" textLength="1195.6" clip-path="url(#terminal-3430482300-line-15)">Add-ons&#160;(_forever_):&#160;updated&#160;SpeakStone_Forever_Main&#160;to&#160;6.1.3,&#160;SpeakStone_Forever_Chatter&#160;to&#160;6.1.3</text><text class="terminal-3430482300-r1" x="1610.4" y="386" textLength="12.2" clip-path="url(#terminal-3430482300-line-15)">
+</text>
+    </g>
+    </g>
+</svg>
