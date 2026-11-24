@@ -16,7 +16,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markup import escape
 
-from . import (APP_NAME, __version__, board, identity, wowtext, locking, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
+from . import (APP_NAME, __version__, addons, board, identity, wowtext, locking, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
                stats, tray as tray_mod, uninstall, update)
 from .keys import KeyReader, drain
 from .runner import WorkerGroup, install_close_handlers
@@ -501,12 +501,38 @@ def update_now(flow, working=False):
 
 
 def wow_survey_lines(install, st, surveyor=wowtext.survey):
-    """Settings: what the WoW-text send finds on this PC, as lines for the screen. Never raises."""
+    """Settings: what the WoW-text send finds on this PC, and how the add-on updates went, as lines. Never raises."""
     try:
         rows = surveyor(install, st["wow_folder"])
-        return wowtext.survey_lines(rows, wowtext.last_run(install) or None)
+        lines = wowtext.survey_lines(rows, wowtext.last_run(install) or None)
     except Exception as e:                           # a strange folder must not take the settings screen down
-        return [f"Could not look at the WoW folders ({type(e).__name__})."]
+        lines = [f"Could not look at the WoW folders ({type(e).__name__})."]
+    try:
+        lines += addons.status_lines(install, st["update_addons"])
+    except Exception as e:
+        lines.append(f"Could not read the add-on update status ({type(e).__name__}).")
+    return lines
+
+
+def update_addons_now(console, install, st, runner=addons.check_and_update, wait=input):
+    """Settings [U]: look for add-on updates now and install them (WoW must be closed). -> the run's result or None."""
+    console.print("Looking for SpeakStone add-on updates on GitHub (WoW must be closed for them to be installed)...")
+    res = runner(install, st["wow_folder"], log=lambda text: console.print(escape(str(text))))
+    if res is None:
+        console.print("An add-on update is already running in the background. Try again in a few minutes.")
+    else:
+        for line in addons.status_lines(install):
+            console.print(escape(line))
+        if res["updated_base"] and st["send_wow_text"]:
+            key = identity.read_key(install)
+            if key:                                  # the update put back the empty receipt: write it again now
+                wowtext.collect_and_send(install, paths.api_base(), key, st["wow_folder"], say=lambda *_: None)
+    console.show_cursor(True)
+    try:
+        wait("Press Enter to go back to Settings. ")
+    except EOFError:
+        pass
+    return res
 
 
 def settings_menu(console, install, st, flow=None, working=lambda: False):
@@ -530,6 +556,9 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
         console.print(f"  [{board.GOLD}][9][/] Update now (this is version [bold]{__version__}[/])")
         console.print(f"  [{board.GOLD}][W][/] Send my captured WoW text automatically: "
                       f"[bold]{'on' if st['send_wow_text'] else 'off'}[/]")
+        console.print(f"  [{board.GOLD}][A][/] Keep my SpeakStone add-ons up to date: "
+                      f"[bold]{'on' if st['update_addons'] else 'off'}[/]")
+        console.print(f"  [{board.GOLD}][U][/] Update my SpeakStone add-ons now (close WoW first)")
         console.print(f"  [{board.GOLD}][F][/] WoW folder, if it is not found by itself: "
                       f"[bold]{escape(st['wow_folder']) or 'look for it'}[/]")
         console.print(f"  [{board.GOLD}][R][/] Look at the WoW folders again")
@@ -547,6 +576,12 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             st["start_on_open"] = not st["start_on_open"]
         elif k == "w":
             st["send_wow_text"] = not st["send_wow_text"]
+        elif k == "a":
+            st["update_addons"] = not st["update_addons"]
+            wow_lines = None
+        elif k == "u":
+            update_addons_now(console, install, st)
+            wow_lines = None
         elif k == "r":
             wow_lines = None
         elif k == "f":
@@ -1467,8 +1502,11 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
         return 2
     setup.sync_worker_files(install, paths.resource_dir())
     log = lambda text: log_background_error(install, text)
-    # Settings [W]: send the add-on's captured text from WoW now and then (does nothing while the setting is off)
-    wowtext.start_auto(install, st, paths.api_base, lambda: identity.read_key(install), log=log)
+    # Settings [W]: send the add-on's captured text from WoW now and then (does nothing while the setting is off).
+    # Settings [A]: before each look, update the installed SpeakStone add-ons when one is due (updates run first, so
+    # the send rewrites WorkerReceipt.lua after an update put back the empty shipped copy).
+    wowtext.start_auto(install, st, paths.api_base, lambda: identity.read_key(install), log=log,
+                       before=lambda: addons.maybe_update(install, st, log=log))
     flow = flow or update.UpdateFlow(log=log, app_exe=paths.app_exe())
     flow.args = ["--background"]               # after an update the new process carries on as the service
     update.cleanup_old(flow.exe)

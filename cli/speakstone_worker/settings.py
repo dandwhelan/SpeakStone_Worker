@@ -19,6 +19,7 @@ DEFAULTS = {
     "start_on_open": True,      # opening the app starts making lines at once (the menu is one key away)
     "auto_update": True,        # fetch and install a newer release by itself; off = only say one is available
     "send_wow_text": True,      # the service sends the add-on's captured quest/gossip/book text from WoW (wowtext.py)
+    "update_addons": True,      # keep the SpeakStone add-ons already installed in WoW up to date (addons.py)
     "wow_folder": "",           # WoW install folder, when it is not in a usual place; blank = look for it
     "wow_text_on_v2": False,    # internal: the one-time switch-on of send_wow_text (owner 2026-11-24) has been done
 }

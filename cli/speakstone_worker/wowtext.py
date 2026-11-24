@@ -900,12 +900,21 @@ def survey_lines(rows, last=None):
     return lines
 
 
-def auto_loop(install, settings, base_fn, key_fn, stop=None, log=lambda s: None, every=AUTO_EVERY, sleep=time.sleep):
-    """The service's background send: when Settings [W] is on, at most every `every` seconds."""
+def auto_loop(install, settings, base_fn, key_fn, stop=None, log=lambda s: None, every=AUTO_EVERY, sleep=time.sleep,
+              before=None):
+    """The service's background send: when Settings [W] is on, at most every `every` seconds.
+    `before` (the add-on update, Settings [A]) runs first on every turn; when it replaced a base add-on its
+    WorkerReceipt.lua is the empty shipped copy, so the send runs straight after to write the receipt again."""
     while not (stop and stop.is_set()):
+        force = False
+        if before is not None:
+            try:
+                force = bool(before())
+            except Exception as e:                   # never let the update take the send (or the worker) down
+                log(f"add-ons: {type(e).__name__}: {e}")
         try:
             settings.reload()
-            if settings["send_wow_text"] and time.time() - last_run(install) >= every:
+            if settings["send_wow_text"] and (force or time.time() - last_run(install) >= every):
                 key = key_fn()
                 if key:
                     s = collect_and_send(install, base_fn(), key, settings["wow_folder"], say=log)
@@ -916,7 +925,8 @@ def auto_loop(install, settings, base_fn, key_fn, stop=None, log=lambda s: None,
         sleep(300)
 
 
-def start_auto(install, settings, base_fn, key_fn, log=lambda s: None):
-    t = threading.Thread(target=auto_loop, args=(install, settings, base_fn, key_fn), kwargs={"log": log}, daemon=True)
+def start_auto(install, settings, base_fn, key_fn, log=lambda s: None, before=None):
+    t = threading.Thread(target=auto_loop, args=(install, settings, base_fn, key_fn),
+                         kwargs={"log": log, "before": before}, daemon=True)
     t.start()
     return t
