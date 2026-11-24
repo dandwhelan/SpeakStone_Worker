@@ -14,6 +14,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 
 from . import (APP_NAME, __version__, board, identity, wowtext, locking, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
                stats, tray as tray_mod, uninstall, update)
@@ -499,9 +500,21 @@ def update_now(flow, working=False):
     return flow.apply()                         # does not return when it worked
 
 
+def wow_survey_lines(install, st, surveyor=wowtext.survey):
+    """Settings: what the WoW-text send finds on this PC, as lines for the screen. Never raises."""
+    try:
+        rows = surveyor(install, st["wow_folder"])
+        return wowtext.survey_lines(rows, wowtext.last_run(install) or None)
+    except Exception as e:                           # a strange folder must not take the settings screen down
+        return [f"Could not look at the WoW folders ({type(e).__name__})."]
+
+
 def settings_menu(console, install, st, flow=None, working=lambda: False):
     ask_site_for_label(install, force=True)          # a rename on the site shows at once
+    wow_lines = None                                 # looked up once per visit, and again after [F] or [R]
     while True:
+        if wow_lines is None:
+            wow_lines = wow_survey_lines(install, st)
         fresh_screen(console)
         console.print(f"\n[{board.GOLD}]SETTINGS[/]")
         console.print(f"  [{board.GOLD}][1][/] Idle minutes before starting: [bold]{st['idle_minutes']}[/]")
@@ -517,7 +530,12 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
         console.print(f"  [{board.GOLD}][9][/] Update now (this is version [bold]{__version__}[/])")
         console.print(f"  [{board.GOLD}][W][/] Send my captured WoW text automatically: "
                       f"[bold]{'on' if st['send_wow_text'] else 'off'}[/]")
-        console.print(f"  [{board.GOLD}][F][/] WoW folder, if it is not found by itself: [bold]{st['wow_folder'] or 'look for it'}[/]")
+        console.print(f"  [{board.GOLD}][F][/] WoW folder, if it is not found by itself: "
+                      f"[bold]{escape(st['wow_folder']) or 'look for it'}[/]")
+        console.print(f"  [{board.GOLD}][R][/] Look at the WoW folders again")
+        console.print(f"      [dim]What it found:[/]")
+        for line in wow_lines:                       # folder and account names may hold [ ]: never read as markup
+            console.print(f"      [dim]{escape(line)}[/]")
         console.print(f"  [{board.GOLD}][B][/] Back")
         with KeyReader() as keys:
             k = keys.wait()
@@ -529,11 +547,14 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             st["start_on_open"] = not st["start_on_open"]
         elif k == "w":
             st["send_wow_text"] = not st["send_wow_text"]
+        elif k == "r":
+            wow_lines = None
         elif k == "f":
             console.show_cursor(True)
-            v = input("WoW folder (for example D:\Games\World of Warcraft), blank to look for it: ").strip().strip('"')
+            v = input("WoW folder (for example D:\\Games\\World of Warcraft), blank to look for it: ").strip().strip('"')
             if not v or os.path.isdir(v):
                 st["wow_folder"] = v
+                wow_lines = None
             else:
                 console.print("That folder does not exist.")
                 time.sleep(2)
@@ -578,7 +599,8 @@ def send_wow_text_now(console, install, st, sender=wowtext.collect_and_send, wai
         return None
     console.print("Looking in your WoW folder for text the SpeakStone add-on captured "
                   "(WoW saves it when you log out or type /reload)...")
-    summary = sender(install, paths.api_base(), key, st["wow_folder"], say=console.print)
+    # folder, account and site messages may hold [ ], which rich would read as markup (or fail on)
+    summary = sender(install, paths.api_base(), key, st["wow_folder"], say=lambda text: console.print(escape(str(text))))
     if summary["files"]:
         console.print(f"Done: {summary['entries']} captured entries sent"
                       + (f", {summary['skipped']} already sent before" if summary["skipped"] else "") + ".")

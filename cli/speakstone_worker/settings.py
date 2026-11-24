@@ -18,8 +18,16 @@ DEFAULTS = {
     "paused_until": 0,          # epoch seconds: a timed pause from the tray, kept so it survives a restart; 0 = none
     "start_on_open": True,      # opening the app starts making lines at once (the menu is one key away)
     "auto_update": True,        # fetch and install a newer release by itself; off = only say one is available
-    "send_wow_text": False,     # the service sends the add-on's captured quest/gossip/book text from WoW (wowtext.py)
+    "send_wow_text": True,      # the service sends the add-on's captured quest/gossip/book text from WoW (wowtext.py)
     "wow_folder": "",           # WoW install folder, when it is not in a usual place; blank = look for it
+    "wow_text_on_v2": False,    # internal: the one-time switch-on of send_wow_text (owner 2026-11-24) has been done
+}
+# Settings whose default changed after release. A cli.json written by an older version holds the old default for every
+# key (save() writes them all), so a new default alone would never reach an existing PC. Each entry switches the key
+# to its new value once, then sets the marker so a player who turns it off again afterwards stays off.
+#   marker key -> (setting, new value)
+MIGRATIONS = {
+    "wow_text_on_v2": ("send_wow_text", True),   # owner 2026-11-24: send captured WoW text automatically by default
 }
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -28,12 +36,31 @@ class Settings:
     def __init__(self, path=None):
         self.path = Path(path) if path else data_dir() / "cli.json"
         self.data = dict(DEFAULTS)
+        d = None
         try:
             d = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(d, dict):
                 self.data.update({k: d[k] for k in DEFAULTS if k in d})
         except (OSError, ValueError):
             pass
+        self._migrate(isinstance(d, dict))
+
+    def _migrate(self, had_file):
+        """Apply MIGRATIONS once. A fresh install (no file yet) already has the new defaults: only the markers are set,
+        in memory, and reach the file with the first save."""
+        todo = [m for m in MIGRATIONS if not self.data.get(m)]
+        if not todo:
+            return
+        for marker in todo:
+            key, value = MIGRATIONS[marker]
+            if had_file:
+                self.data[key] = value
+            self.data[marker] = True
+        if had_file:
+            try:
+                self.save()
+            except OSError:
+                pass                                 # read-only folder: it is tried again on the next start
 
     def reload(self):
         """Read the file again, so a change made in another window (the menu, the tray) is seen by a running process."""
