@@ -65,14 +65,15 @@ for key, text, val in (("W", "Send my captured WoW text automatically", "on"),
                        ("U", "Update my SpeakStone add-ons now (close WoW first)", None),
                        ("L", "Show what was sent (upload log)", None)):
     c.print(f"  [#e9bb4d][{key}][/] {text}" + (f": [bold]{val}[/]" if val else ""))
-c.print("      [dim]What it found:[/]")
-lines = wowtext.survey_lines(rows, time.time())
-lines.append("Last upload: 2026-11-24 21:13  _forever_ / ACCOUNT#1: sent 2 entries, the site took 1 new lines "
-             "(1 already known)  https://speakstone.beanw.co.uk/s/...")
-lines += ["Add-ons (_retail_): up to date",
-          "Add-ons (_forever_): updated SpeakStone_Forever_Main to 6.1.3, SpeakStone_Forever_Chatter to 6.1.3"]
-for line in lines:
-    c.print(f"      [dim]{escape(line)}[/]")
+import tempfile
+from speakstone_worker import addons, cli
+fake = Path(tempfile.mkdtemp())                     # sample upload log and add-on state, no real data
+wowtext.log_upload(fake, "_forever_ / ACCOUNT#1: sent 2 entries, the site took 1 new lines (1 already known)  "
+                         "https://speakstone.beanw.co.uk/s/...")
+addons.save_state(fake, {"last_check": time.time(), "games": {
+    "_retail_": {"checked": True},
+    "_forever_": {"checked": True, "updated": ["SpeakStone_Forever_Main to 6.1.3", "SpeakStone_Forever_Chatter to 6.1.3"]}}})
+c.print(cli.wow_survey_view(fake, {"wow_folder": "", "update_addons": True}, surveyor=lambda *a: rows))
 save(c, "settings.svg")
 
 # 4. an add-on update run

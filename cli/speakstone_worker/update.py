@@ -431,10 +431,34 @@ def heal_spinning_host(args, platform=None, frozen=None, env=None, host=console_
         return False
 
 
+def wait_started(proc, table=_process_table, clock=None, sleep=None, limit=120.0):
+    """Keep the old window until the new program is past Windows' first-start check. The released program unpacks
+    itself and starts its real part as a child process; until that child exists its new window is empty. The first
+    start of a newly downloaded program can take a minute (Windows scans it), and the owner saw an empty window with
+    no word in the old one (2026-11-24, 1.2.22 -> 1.2.23). -> True when the child was seen. Never raises."""
+    import time as _time
+    clock, sleep = clock or _time.monotonic, sleep or _time.sleep
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        return False
+    end = clock() + limit
+    try:
+        while clock() < end:
+            if proc.poll() is not None:
+                return False
+            if any(parent == pid for parent, _name in table().values()):
+                return True
+            sleep(0.5)
+    except Exception:
+        pass
+    return False
+
+
 def swap_windows(exe, new, args, rename=os.rename, replace=os.replace, spawn=_spawn_detached, remove=_remove,
-                 exit_fn=sys.exit):
+                 exit_fn=sys.exit, say=None, wait=wait_started):
     """A running exe can be renamed but not overwritten: move it to `.old`, put the new one in its place, start it,
-    leave. If the second step fails the old name is put back and nothing has changed."""
+    leave. If the second step fails the old name is put back and nothing has changed. `say` (menu windows only)
+    gets one line, and then the old window stays until the new one is drawing."""
     exe, new = Path(exe), Path(new)
     old = free_old_name(exe, remove)
     rename(exe, old)
@@ -444,13 +468,20 @@ def swap_windows(exe, new, args, rename=os.rename, replace=os.replace, spawn=_sp
         rename(old, exe)
         raise
     try:
-        spawn(relaunch_command(exe, args, "win32"))
+        proc = spawn(relaunch_command(exe, args, "win32"))
     except OSError:
         raise UpdateError("the new version is in place but could not be started; it starts next time")
+    if say is not None and "--background" not in args and "--headless" not in args:
+        try:
+            say("The new version opens in a new window. Its first start can take up to a minute while Windows "
+                "checks the new file; this window closes when it is ready.")
+        except Exception:
+            pass
+        wait(proc)
     exit_fn(0)
 
 
-def swap_linux(exe, new, args, replace=os.replace, execv=os.execv):
+def swap_linux(exe, new, args, replace=os.replace, execv=os.execv, say=None):     # same window: nothing to say
     env = _child_env()                       # the new program must not start with OUR private library path
     for k in ("LD_LIBRARY_PATH", "LD_LIBRARY_PATH_ORIG"):
         os.environ.pop(k, None)
@@ -514,6 +545,7 @@ class UpdateFlow:
         self.before_swap = None         # called just before a swap that follows a drain (writes the resume marker)
         self.swap_failed = None
         self.staged = None              # a downloaded and proven new file, waiting for the swap
+        self.say = None                 # a menu window: one line before the swap, then it waits for the new window
         self.frozen = getattr(sys, "frozen", False) if frozen is None else frozen
         self.exe = exe if exe is not None else (sys.executable if self.frozen else None)
         self.app_exe = app_exe
@@ -628,7 +660,8 @@ class UpdateFlow:
         if msg:
             return msg
         try:
-            self.apply_fn(self.release, self.exe, self.args, fetch=lambda r, e: self.staged)
+            ops = {"say": self.say} if self.say is not None else {}
+            self.apply_fn(self.release, self.exe, self.args, fetch=lambda r, e: self.staged, **ops)
         except UpdateError as e:
             self.log(f"update not installed: {e}")
             self.release, self.staged = None, None            # tried again at the next check

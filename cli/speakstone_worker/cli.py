@@ -516,6 +516,110 @@ def wow_survey_lines(install, st, surveyor=wowtext.survey):
     return lines
 
 
+def _addon_update_cell(g):
+    """One game's add-on update state (addons.py state) as a short coloured cell."""
+    if not g:
+        return "[dim]-[/]"
+    if g.get("problems"):
+        return f"[red]not updated[/] [dim]({escape(g['problems'][0][:40])})[/]"
+    if g.get("waiting"):
+        return f"[{board.GOLD}]{len(g['waiting'])} waiting for WoW to close[/]"
+    if g.get("updated"):
+        vers = {u.rsplit(" to ", 1)[-1] for u in g["updated"]}
+        n = len(g["updated"])
+        return f"[green]updated {n} add-on{'s' if n != 1 else ''}" + (f" to {escape(vers.pop())}" if len(vers) == 1 else "") + "[/]"
+    if g.get("checked") or not g.get("skipped"):
+        return "[green]up to date[/]"
+    return "[dim]nothing to update[/]"
+
+
+def wow_survey_view(install, st, surveyor=wowtext.survey):
+    """Settings: what it found in the WoW folders, as a table (one row per game) plus the last upload. Never raises.
+    Until 1.2.24 this was a block of dim sentences (owner 2026-11-24: "easier to read and nicer to view")."""
+    from rich.console import Group
+    from rich.table import Table
+    from rich import box
+    parts = []
+    try:
+        rows = surveyor(install, st["wow_folder"])
+    except Exception as e:                           # a strange folder must not take the settings screen down
+        return Group(f"      [red]Could not look at the WoW folders ({type(e).__name__}).[/]")
+    if not rows:
+        return Group(f"      [{board.GOLD}]No WoW folder found.[/] Set it with [{board.GOLD}][F][/].")
+    try:
+        upd = addons.load_state(install) if st["update_addons"] else {}
+    except Exception:
+        upd = {}
+    games = upd.get("games") or {}
+    folders = sorted({r["folder"] for r in rows})
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False, padding=(0, 2), header_style=f"bold {board.GOLD}")
+    t.add_column("Game", style="bold", no_wrap=True)
+    t.add_column("SpeakStone", no_wrap=True)
+    t.add_column("Voice packs", justify="right")
+    t.add_column("Captured", justify="right")
+    t.add_column("To send", justify="right")
+    t.add_column("Add-on updates" if st["update_addons"] else "Add-on updates (off)")
+    for r in sorted(rows, key=lambda r: (not r["addons"], r["name"])):
+        name = escape(r["name"])
+        if len(folders) > 1:
+            name += f"\n[dim not bold]{escape(r['folder'])}[/]"
+        if r["addons"]:
+            ver = ", ".join(f"[green]{escape(str(v))}[/]" for v in r["addons"].values())
+            packs = str(r["packs"]) if r["packs"] else "[dim]none[/]"
+        else:
+            ver, packs = "[dim]not installed[/]", "[dim]-[/]"
+        files = r["files"]
+        bad = [f for f in files if f["error"]]
+        if not files:
+            captured = "[dim]-[/]" if not r["addons"] else "[dim]nothing yet[/]"
+            waiting = "[dim]-[/]"
+        else:
+            total = sum(f["entries"] for f in files)
+            wait = sum(f["waiting"] for f in files)
+            captured = str(total) + (f" [dim]({len(files)} accounts)[/]" if len(files) > 1 else "")
+            if bad:
+                captured += " [red](1 file unreadable)[/]" if len(bad) == 1 else f" [red]({len(bad)} unreadable)[/]"
+            if r["test_realm"]:
+                waiting = "[dim]test realm, never sent[/]"
+            else:
+                waiting = f"[{board.GOLD}]{wait}[/]" if wait else "[green]0[/]"
+        cell = _addon_update_cell(games.get(r["game"])) if r["addons"] and st["update_addons"] else "[dim]-[/]"
+        t.add_row(name, ver, packs, captured, waiting, cell)
+    title = "[bold]What it found[/]"
+    if len(folders) == 1:
+        title += f"  [dim]in {escape(folders[0])}[/]"
+    parts.append(title)
+    parts.append(t)
+    if any(r["addons"] and not r["files"] for r in rows):
+        parts.append("[dim]Nothing captured yet: WoW saves it when you log out or type /reload.[/]")
+    parts.append("")
+    last = wowtext.recent_uploads(install, 1)
+    if last:
+        line = last[0]
+        url = ""
+        m = re.search(r"\s+(https://\S+)\s*$", line)
+        if m:
+            line, url = line[:m.start()], m.group(1)
+        for folder, nice in wowtext.GAME_NAMES.items():
+            line = line.replace(f"  {folder} / ", f"  {nice} / ")
+        line = re.sub(r"(\s{2}[^/]+) / [^:]+:", r"\1:", line, count=1)       # the account name adds nothing here
+        parts.append(f"[bold]Last upload[/]  {escape(line)}")
+        if url:
+            parts.append(f"             [dim]{escape(url)}[/]")
+    else:
+        parts.append(f"[bold]Last upload[/]  [dim]none yet ([{board.GOLD}][L][/] shows the upload log)[/]")
+    stamps = []
+    looked = wowtext.last_run(install)
+    if looked:
+        stamps.append("folders looked at " + time.strftime("%Y-%m-%d %H:%M", time.localtime(looked)))
+    if upd.get("last_check"):
+        stamps.append("add-ons checked " + time.strftime("%Y-%m-%d %H:%M", time.localtime(upd["last_check"])))
+    if stamps:
+        parts.append("[dim]" + "  ·  ".join(stamps) + "[/]")
+    from rich.padding import Padding
+    return Padding(Group(*parts), (1, 0, 1, 6))
+
+
 def update_addons_now(console, install, st, runner=addons.check_and_update, wait=input):
     """Settings [U]: look for add-on updates now and install them (WoW must be closed). -> the run's result or None."""
     console.print("Looking for SpeakStone add-on updates on GitHub (WoW must be closed for them to be installed)...")
@@ -559,7 +663,7 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
     wow_lines = None                                 # looked up once per visit, and again after [F] or [R]
     while True:
         if wow_lines is None:
-            wow_lines = wow_survey_lines(install, st)
+            wow_lines = wow_survey_view(install, st)
         fresh_screen(console)
         console.print(f"\n[{board.GOLD}]SETTINGS[/]")
         console.print(f"  [{board.GOLD}][1][/] Idle minutes before starting: [bold]{st['idle_minutes']}[/]")
@@ -582,9 +686,7 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
                       f"[bold]{escape(st['wow_folder']) or 'look for it'}[/]")
         console.print(f"  [{board.GOLD}][R][/] Look at the WoW folders again")
         console.print(f"  [{board.GOLD}][L][/] Show what was sent (upload log)")
-        console.print(f"      [dim]What it found:[/]")
-        for line in wow_lines:                       # folder and account names may hold [ ]: never read as markup
-            console.print(f"      [dim]{escape(line)}[/]")
+        console.print(wow_lines)                     # folder and account names are escaped in there
         console.print(f"  [{board.GOLD}][B][/] Back")
         with KeyReader() as keys:
             k = keys.wait()
@@ -1672,6 +1774,7 @@ def main(argv=None):
     set_title(window_title())
     threading.Thread(target=lambda: wake_service(install), daemon=True).start()
     flow = update.UpdateFlow(log=lambda text: log_background_error(install, text), app_exe=paths.app_exe(), args=[])
+    flow.say = lambda text: console.print(escape(text))     # this window says the new one is coming, then waits for it
     update.cleanup_old(flow.exe)
     looker = None
     labeller = threading.Thread(target=lambda: identity.refresh(install, paths.api_base()), daemon=True)
