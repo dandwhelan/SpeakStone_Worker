@@ -725,8 +725,46 @@ def post_export(base, key, source, opener=open_url, timeout=60):
     # is not the site's JSON object (a proxy page, a captive portal) must not be taken for one.
     if not isinstance(data, dict) or not (isinstance(data.get("counts"), dict) or data.get("submission_id")):
         return False, "The site did not confirm it."
-    counts = data.get("counts")
-    return True, counts if isinstance(counts, dict) else {}
+    counts = dict(data["counts"]) if isinstance(data.get("counts"), dict) else {}
+    sid = data.get("submission_id")
+    if isinstance(sid, str) and _SUBMISSION_ID.match(sid):
+        counts["submission_id"] = sid               # for the upload log's link to the site's receipt page
+    return True, counts
+
+
+# --------------------------------------------------------------------------
+# The upload log: one line per upload (or failure), so a player can see what went and check it on the site
+# --------------------------------------------------------------------------
+
+UPLOAD_LOG = "wow_uploads.log"
+UPLOAD_LOG_MAX = 256 * 1024
+_SUBMISSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def upload_log_path(install):
+    return Path(install) / "work" / "logs" / UPLOAD_LOG
+
+
+def log_upload(install, text, now=None):
+    """Append one line to the upload log. Best effort: logging never stops a send."""
+    p = upload_log_path(install)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.is_file() and p.stat().st_size > UPLOAD_LOG_MAX:     # keep the newest half
+            keep = p.read_text(encoding="utf-8", errors="replace")[-UPLOAD_LOG_MAX // 2:]
+            p.write_text(keep[keep.find("\n") + 1:], encoding="utf-8")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M", time.localtime(now or time.time())) + "  " + text + "\n")
+    except OSError:
+        pass
+
+
+def recent_uploads(install, n=20):
+    """The last n lines of the upload log, newest last."""
+    try:
+        return upload_log_path(install).read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+    except OSError:
+        return []
 
 
 def collect_and_send(install, base, key, wow_folder="", poster=post_export, roots=None, say=print):
@@ -765,6 +803,7 @@ def collect_and_send(install, base, key, wow_folder="", poster=post_export, root
             if not ok:
                 summary["errors"].append(f"{where}: {res}")
                 say(f"{where}: {res}")
+                log_upload(install, f"{where}: NOT SENT, {len(fps)} entries kept for next time ({res})")
                 break
             sent.update(fps)
             save_sent(install, sent)               # after every upload, so a later failure does not resend this one
@@ -773,6 +812,10 @@ def collect_and_send(install, base, key, wow_folder="", poster=post_export, root
             summary["new"] += int(res.get("new", 0) or 0)
             say(f"{where}: sent {len(fps)} captured entries "
                 f"({res.get('new', 0)} new lines, {res.get('known', 0)} already known).")
+            sid = res.get("submission_id")
+            log_upload(install, f"{where}: sent {len(fps)} entries, the site took {res.get('new', 0)} new lines "
+                                f"({res.get('known', 0)} already known)"
+                                + (f"  {base.rstrip('/')}/s/{sid}" if sid else ""))
     save_sent(install, sent)
 
     # Clear what the site confirmed: one receipt per add-on folder, covering every account's store in that game.

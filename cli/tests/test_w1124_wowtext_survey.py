@@ -165,7 +165,35 @@ def test_only_a_real_site_reply_counts_as_sent():
     assert not ok
     ok, counts = wowtext.post_export("https://site", "k", "x",
                                      opener=lambda req, timeout: R(b'{"submission_id": "s", "counts": {"new": 3}}'))
-    assert ok and counts == {"new": 3}
+    assert ok and counts == {"new": 3, "submission_id": "s"}
+
+
+# ---- the upload log (Settings [L]): what was sent, with a link to the site's page for it
+def test_each_upload_and_failure_is_logged_with_its_link(tmp_path):
+    root = make_wow(tmp_path)
+    install = tmp_path / "app"
+    install.mkdir()
+    wowtext.collect_and_send(install, "https://site", "k", poster=lambda *a: (False, "Could not reach the site."),
+                             roots=[root], say=lambda *_: None)
+    wowtext.collect_and_send(install, "https://site/", "k",
+                             poster=lambda *a: (True, {"new": 1, "known": 1, "submission_id": "abc-123"}),
+                             roots=[root], say=lambda *_: None)
+    log = wowtext.recent_uploads(install)
+    assert len(log) == 2
+    assert "NOT SENT, 2 entries kept for next time (Could not reach the site.)" in log[0]
+    assert "_retail_ / 123#1: sent 2 entries, the site took 1 new lines (1 already known)" in log[1]
+    assert log[1].endswith("https://site/s/abc-123")
+
+
+def test_a_strange_submission_id_never_becomes_a_link():
+    class R:
+        def __init__(self, body): self.body = body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, n): return self.body
+    ok, res = wowtext.post_export("https://site", "k", "x",
+                                  opener=lambda req, timeout: R(b'{"submission_id": "../evil?x=1", "counts": {}}'))
+    assert ok and "submission_id" not in res
 
 
 def test_windows_line_breaks_read_as_before(tmp_path):

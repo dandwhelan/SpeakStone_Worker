@@ -507,6 +507,8 @@ def wow_survey_lines(install, st, surveyor=wowtext.survey):
         lines = wowtext.survey_lines(rows, wowtext.last_run(install) or None)
     except Exception as e:                           # a strange folder must not take the settings screen down
         lines = [f"Could not look at the WoW folders ({type(e).__name__})."]
+    last = wowtext.recent_uploads(install, 1)
+    lines.append(f"Last upload: {last[0]}" if last else "Last upload: none yet ([L] shows the upload log)")
     try:
         lines += addons.status_lines(install, st["update_addons"])
     except Exception as e:
@@ -533,6 +535,23 @@ def update_addons_now(console, install, st, runner=addons.check_and_update, wait
     except EOFError:
         pass
     return res
+
+
+def show_upload_log(console, install, wait=input, n=25):
+    """Settings [L]: what the WoW-text send has uploaded, newest last, with a link to each upload on the site."""
+    fresh_screen(console)
+    console.print(f"\n[{board.GOLD}]WOW TEXT SENT TO THE SITE[/] (last {n})")
+    lines = wowtext.recent_uploads(install, n)
+    if not lines:
+        console.print("Nothing sent yet. The send runs every few hours in the background, or now from menu [4].")
+    for line in lines:
+        console.print("  " + escape(line))
+    console.print(f"\n[dim]The full log: {escape(str(wowtext.upload_log_path(install)))}[/]")
+    console.show_cursor(True)
+    try:
+        wait("Press Enter to go back to Settings. ")
+    except EOFError:
+        pass
 
 
 def settings_menu(console, install, st, flow=None, working=lambda: False):
@@ -562,6 +581,7 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
         console.print(f"  [{board.GOLD}][F][/] WoW folder, if it is not found by itself: "
                       f"[bold]{escape(st['wow_folder']) or 'look for it'}[/]")
         console.print(f"  [{board.GOLD}][R][/] Look at the WoW folders again")
+        console.print(f"  [{board.GOLD}][L][/] Show what was sent (upload log)")
         console.print(f"      [dim]What it found:[/]")
         for line in wow_lines:                       # folder and account names may hold [ ]: never read as markup
             console.print(f"      [dim]{escape(line)}[/]")
@@ -584,6 +604,8 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             wow_lines = None
         elif k == "r":
             wow_lines = None
+        elif k == "l":
+            show_upload_log(console, install)
         elif k == "f":
             console.show_cursor(True)
             v = input("WoW folder (for example D:\\Games\\World of Warcraft), blank to look for it: ").strip().strip('"')
