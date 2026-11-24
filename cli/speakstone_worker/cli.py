@@ -559,10 +559,14 @@ def wow_survey_view(install, st, surveyor=wowtext.survey):
     t.add_column("Captured", justify="right")
     t.add_column("To send", justify="right")
     t.add_column("Add-on updates" if st["update_addons"] else "Add-on updates (off)")
-    for r in sorted(rows, key=lambda r: (not r["addons"], r["name"])):
+    supported = ("_retail_", "_forever_")       # SpeakStone is made for these two only (owner 2026-11-24)
+    for r in sorted(rows, key=lambda r: (r["game"] not in supported, not r["addons"], r["name"])):
         name = escape(r["name"])
         if len(folders) > 1:
             name += f"\n[dim not bold]{escape(r['folder'])}[/]"
+        if r["game"] not in supported:
+            t.add_row(f"[dim]{name}[/]", "[dim]not supported[/]", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]")
+            continue
         if r["addons"]:
             ver = ", ".join(f"[green]{escape(str(v))}[/]" for v in r["addons"].values())
             packs = str(r["packs"]) if r["packs"] else "[dim]none[/]"
@@ -590,7 +594,7 @@ def wow_survey_view(install, st, surveyor=wowtext.survey):
         title += f"  [dim]in {escape(folders[0])}[/]"
     parts.append(title)
     parts.append(t)
-    if any(r["addons"] and not r["files"] for r in rows):
+    if any(r["addons"] and not r["files"] and r["game"] in supported for r in rows):
         parts.append("[dim]Nothing captured yet: WoW saves it when you log out or type /reload.[/]")
     parts.append("")
     last = wowtext.recent_uploads(install, 1)

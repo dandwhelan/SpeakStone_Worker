@@ -1,5 +1,5 @@
 """SpeakStone Worker, command-line edition."""
-__version__ = "1.2.24"
+__version__ = "1.2.25"
 APP_NAME = "SpeakStone Worker"
 TAGLINE = "Lend your graphics card to the voice-line queue."
 DISCLAIMER = "Unofficial; not affiliated with Blizzard Entertainment"

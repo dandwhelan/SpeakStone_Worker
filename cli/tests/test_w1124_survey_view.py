@@ -25,7 +25,7 @@ def test_table_shows_each_game_version_and_counts(tmp_path):
     retail = next(l for l in out.splitlines() if "Retail" in l)
     for bit in ("6.1.3", "16", "22", "3"):
         assert bit in retail
-    assert "not installed" in out and "ACC[1]" not in out
+    assert "not supported" in next(l for l in out.splitlines() if "Classic Era" in l) and "ACC[1]" not in out
     assert "Last upload" in out and "none yet" in out
 
 
@@ -52,3 +52,12 @@ def test_addon_update_cell():
     assert "updated 2 add-ons to 6.1.3" in cli._addon_update_cell(
         {"updated": ["SpeakStone_Main to 6.1.3", "SpeakStone_Pack_X to 6.1.3"]})
     assert "waiting for WoW" in cli._addon_update_cell({"waiting": ["a"]})
+
+
+def test_only_retail_and_forever_are_supported(tmp_path):
+    rows = [dict(ROWS[0], game="_ptr_", name="Retail PTR"), dict(ROWS[0], game="_forever_", name="WoW Forever",
+                                                                 addons={}, files=[])]
+    out = text(cli.wow_survey_view(tmp_path, {"wow_folder": "", "update_addons": True}, surveyor=lambda *a: rows))
+    ptr = next(l for l in out.splitlines() if "Retail PTR" in l)
+    assert "not supported" in ptr and "6.1.3" not in ptr
+    assert "not installed" in next(l for l in out.splitlines() if "WoW Forever" in l)
