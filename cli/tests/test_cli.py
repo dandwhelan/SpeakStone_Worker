@@ -289,6 +289,7 @@ def test_key_only_in_child_env_not_argv_logs_or_files(tmp_path, caplog):
 def test_setup_resumes_after_interruption(tmp_path):
     calls, logs = [], []
     env = make_env(tmp_path, calls, logs, fail_at="snapshot_download")
+    fail_after_other_lane_starts(env, _is_model, _is_torch, 0)
     with pytest.raises(setup.SetupError):
         setup.run_setup(env)
     assert "model" not in setup.load_state(env) and "torch" in setup.load_state(env)
@@ -343,6 +344,21 @@ def wrap_run(env, hook):
     env.run = run
 
 
+def fail_after_other_lane_starts(env, failing, other, other_secs):
+    """The failing lane's command waits until the other lane's command has started, which then runs other_secs.
+    Without the wait a fast failure can set the stop flag before the other lane's thread starts its first step, so
+    that step never runs and a test expecting it to finish fails at random (seen on the Linux runner, 2026-11-25)."""
+    started = threading.Event()
+
+    def hook(c):
+        if other(c):
+            started.set()
+            time.sleep(other_secs)
+        elif failing(c):
+            assert started.wait(10), "the other lane never started"
+    wrap_run(env, hook)
+
+
 def test_lanes_really_overlap(tmp_path):
     env = make_env(tmp_path, [], [])
     torch_in, model_in = threading.Event(), threading.Event()
@@ -374,7 +390,7 @@ def test_hf_hub_installed_before_the_download_lane_starts(tmp_path):
 def test_failure_in_download_lane_lets_the_other_lane_step_finish(tmp_path):
     calls = []
     env = make_env(tmp_path, calls, [], fail_at="snapshot_download")
-    wrap_run(env, lambda c: time.sleep(0.4) if _is_torch(c) else None)    # torch is still running when the model fails
+    fail_after_other_lane_starts(env, _is_model, _is_torch, 0.4)        # torch is still running when the model fails
     with pytest.raises(setup.SetupError, match="voice model"):
         setup.run_setup(env)
     state = setup.load_state(env)
@@ -390,7 +406,7 @@ def test_failure_in_download_lane_lets_the_other_lane_step_finish(tmp_path):
 
 def test_failure_in_pip_lane_lets_the_download_finish_and_raises(tmp_path):
     env = make_env(tmp_path, [], [], fail_at="torch==2.8.0+cu128")
-    wrap_run(env, lambda c: time.sleep(0.3) if _is_model(c) else None)
+    fail_after_other_lane_starts(env, _is_torch, _is_model, 0.3)
     with pytest.raises(setup.SetupError, match="graphics-card libraries"):
         setup.run_setup(env)
     state = setup.load_state(env)
