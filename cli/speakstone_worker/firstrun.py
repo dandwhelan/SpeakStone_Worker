@@ -14,9 +14,9 @@ other PC it is shown locked off, with the reason.
 from rich.markup import escape
 from rich.text import Text
 
-from . import board, stats
+from . import board, setup, stats
 
-SUGGEST_TWO_MIB = 15500             # a "16 GB" card reports 16303-16384 MiB; two workers need about 5 GB each plus room
+SUGGEST_TWO_MIB = setup.MIN_TOTAL_MIB_FOR_TWO      # offered exactly where Settings [5] allows it (16 GB+)
 IDLE_CHOICES = (5, 10, 20, 30, 60)
 
 

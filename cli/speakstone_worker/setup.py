@@ -712,7 +712,7 @@ def step_enroll(env):
 
 # Two workers on one card: each is an ordinary one-lease worker with its own key (the site limits a key to one lease,
 # so sharing a key would hand the second process the first one's job).
-MIN_TOTAL_MIB_FOR_TWO = 12000            # a "12 GB" card reports 12282-12288 MiB
+MIN_TOTAL_MIB_FOR_TWO = 15500            # 16 GB+ (owner 2026-11-25; 12 GB until 1.2.25): a "16 GB" card reports 16303-16384 MiB
 MIN_FREE_MIB_FOR_TWO = 10000             # about 5 GB for each process; "10 GB" cards report a little under 10240
 
 
@@ -721,7 +721,7 @@ def second_worker_allowed(gpu):
     if not gpu:
         return False, "No NVIDIA graphics card was found."
     if gpu.get("mem_total_mib", 0) < MIN_TOTAL_MIB_FOR_TWO:
-        return False, "Two workers need a graphics card with at least 12 GB of memory."
+        return False, "Two workers need a graphics card with at least 16 GB of memory."
     if gpu["mem_total_mib"] - gpu.get("mem_used_mib", 0) < MIN_FREE_MIB_FOR_TWO:
         return False, "Two workers need about 10 GB of free graphics memory right now. Close other programs and try again."
     return True, ""

@@ -755,8 +755,8 @@ def test_second_worker_gate():
     ok, _ = setup.second_worker_allowed(gpu_rd(16384, 1200))
     assert ok
     assert not setup.second_worker_allowed(gpu_rd(8192))[0]
-    assert not setup.second_worker_allowed(gpu_rd(12288, 4000))[0]          # only 8 GB free
-    assert setup.second_worker_allowed(gpu_rd(12288, 1500))[0]
+    assert not setup.second_worker_allowed(gpu_rd(16384, 7000))[0]          # only 9 GB free
+    assert not setup.second_worker_allowed(gpu_rd(12288, 500))[0]           # 12 GB is not enough since 1.2.26
     assert not setup.second_worker_allowed(None)[0]
 
 
@@ -793,7 +793,7 @@ def test_set_workers_gate_toggle_and_429_message(tmp_path, monkeypatch):
     monkeypatch.setattr(setup, "artifact_ok", lambda install, name: True)     # the state file alone is not enough now
     st = settings.Settings(tmp_path / "cli.json")
     assert st["workers"] == 1
-    assert "12 GB" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(8192))
+    assert "16 GB" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(8192))
     assert st["workers"] == 1
     # not set up -> asks for setup first
     assert "setup" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(16384, 100))
