@@ -111,6 +111,7 @@ class Env:
     machine_name: str = ""
     probe: callable = None                              # (cmd list, timeout seconds) -> (exit code, output text); None = real
     light: bool = False                                 # LIGHT_STEPS only (no voice engine): needs little disk
+    carry_name: callable = None                         # (old label, old key) -> bool: a replaced text key's name
 
     @property
     def _exe(self):
@@ -691,6 +692,13 @@ def step_enroll(env):
     key from the light setup is kept by the light setup and replaced by the full one (the site cannot upgrade it)."""
     if config_has_key(env.config_file) and (env.light or not text_key(env.install)):
         return
+    old_label = old_key = ""
+    if text_key(env.install):                    # being replaced: keep its name and key to carry the name across
+        try:
+            old_label = str(json.loads(env.enrolled_file.read_text(encoding="utf-8")).get("label") or "")
+            old_key = json.loads(Path(env.config_file).read_text(encoding="utf-8")).get("worker_key") or ""
+        except (OSError, ValueError, AttributeError):
+            pass
     try:                                    # an empty or broken file is not a key: join again instead of waiting forever
         Path(env.config_file).unlink()
     except OSError:
@@ -709,6 +717,9 @@ def step_enroll(env):
     env.enrolled_file.write_text(json.dumps({"worker_id": info.get("worker_id"), "label": info.get("label"),
                                              "tier": info.get("tier"), "purpose": info.get("purpose") or "gpu"}),
                                  encoding="utf-8")
+    if old_label and env.carry_name and env.carry_name(old_label, old_key):
+        info["label"] = old_label
+    old_key = ""
     env.progress("enroll", 1, f"Joined the queue as {info.get('label') or 'a new worker'}")
 
 

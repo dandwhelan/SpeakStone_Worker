@@ -373,3 +373,60 @@ def test_me_answer_records_the_kind_of_key(tmp_path):
 
 class _MeResp(_Resp):
     status = 200
+
+
+# ---- a replaced text key's name is carried across
+def test_carry_name_frees_the_old_name_then_takes_it(tmp_path):
+    (tmp_path / "enrolled.json").write_text(json.dumps({"label": "Worker 41"}))
+    calls, held = [], {"Moonwell": "old"}
+
+    def renamer(install, base, name, key=None):
+        calls.append((name, key))
+        owner = "old" if key else "new"
+        if name in held and held[name] != owner:
+            return False, identity.TAKEN
+        held.pop(next((n for n, o in held.items() if o == owner), None), None)
+        held[name] = owner
+        return True, "ok"
+    assert identity.carry_name(tmp_path, "https://x", "Moonwell", "OLDKEY", renamer=renamer)
+    assert calls == [("Moonwell", None), ("Moonwell old", "OLDKEY"), ("Moonwell", None)]
+    assert held == {"Moonwell": "new", "Moonwell old": "old"}
+
+
+def test_carry_name_skips_site_default_names_and_never_raises(tmp_path):
+    called = []
+    assert not identity.carry_name(tmp_path, "https://x", "Worker 9", "k", renamer=lambda *a, **k: called.append(1))
+    assert not identity.carry_name(tmp_path, "https://x", "", "k", renamer=lambda *a, **k: called.append(1))
+    assert called == []
+
+    def boom(*a, **k):
+        raise RuntimeError("x")
+    assert identity.carry_name(tmp_path, "https://x", "Moonwell", "k", renamer=boom) is False
+
+
+def test_rename_with_a_given_key_saves_nothing(tmp_path):
+    (tmp_path / "enrolled.json").write_text(json.dumps({"label": "Worker 41"}))
+    sent = []
+
+    def opener(req, timeout):
+        sent.append(req.headers["Authorization"])
+        return _MeResp({"worker": {"label": "Moonwell old", "tier": "public"}})
+    ok, _ = identity.rename(tmp_path, "https://x", "Moonwell old", opener=opener, key="OLDKEY")
+    assert ok and sent == ["Bearer OLDKEY"] and identity.label_of(tmp_path) == "Worker 41"
+
+
+def test_replacing_a_text_key_carries_its_name(tmp_path):
+    inst = tmp_path / "inst"
+    _keyed(inst, "text")
+    (inst / "enrolled.json").write_text(json.dumps({"label": "Moonwell", "purpose": "text"}))
+    carried = []
+
+    def run(cmd, e, cwd, on_line):
+        (inst / "worker_config.json").write_text(json.dumps({"worker_key": e["SSW_WORKER_KEY"]}))
+        return 0
+    enr = lambda machine_name=None: {"key": "sswk_" + "g" * 43, "label": "Worker 77", "purpose": "gpu"}
+    env = setup.Env(inst, tmp_path, run=run, enroll=enr, base_env={},
+                    carry_name=lambda label, key: carried.append((label, key)) or True)
+    setup.step_enroll(env)
+    assert carried == [("Moonwell", "sswk_" + "t" * 43)]
+    assert not setup.text_key(inst)

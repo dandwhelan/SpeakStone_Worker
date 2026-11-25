@@ -11,7 +11,8 @@ Worker asks again without `purpose` (an ordinary key, NVIDIA 8 GB+ only).
 - Remembers the kind of key in `enrolled.json` (`"purpose": "text" | "gpu"`), from the enrol and from `GET /me`'s
   `worker.purpose`.
 - A text key keeps the light setup happy, but does not count as a finished full setup. Turning the lines on
-  (Settings [G]) and choosing Start now enrols again without `purpose` and replaces the key: the site cannot upgrade one.
+  (Settings [G]) and choosing Start now enrols again without `purpose` and replaces the key: the site cannot upgrade one. A name the player chose is
+  carried across to the new key (the old key is renamed "<name> old" first when the site says the name is taken).
 - `net_worker.py` stops (exit 3, key) on `403 {"code": "text_only"}` instead of waiting as if paused.
 
 **Site rules a text key lives under:** harvest and `/me` (GET, rename) only; claim, heartbeat, upload-urls, complete

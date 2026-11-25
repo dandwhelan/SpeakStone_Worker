@@ -235,7 +235,8 @@ def run_setup_ui(console, install, base, only=None):
 
     env = setup.Env(install, paths.resource_dir(), download=download, run=setup.real_run, enroll=do_enroll,
                     gpu_total_mib=stats.gpu_total_mib, progress=progress, api_base=(api if os.environ.get("SPEAKSTONE_API_BASE") else ""),
-                    machine_name=host, light=bool(only))
+                    machine_name=host, light=bool(only),
+                    carry_name=lambda label, key: identity.carry_name(install, api, label, key))
     with live:
         redraw()
         try:

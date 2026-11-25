@@ -143,14 +143,19 @@ def _error_text(err):
         return ""
 
 
+TAKEN = "That name is taken. Pick another."
+
+
 def rename(install, base, name, opener=open_url, timeout=10.0, now=None, config="worker_config.json",
-           enrolled="enrolled.json"):
+           enrolled="enrolled.json", key=None):
     """POST the new label. -> (True, "Renamed to X") or (False, sentence in plain words). Never includes the key.
-    `config` / `enrolled` pick the worker: the defaults are the first one, CONFIG_2 / ENROLLED_2 the second."""
+    `config` / `enrolled` pick the worker: the defaults are the first one, CONFIG_2 / ENROLLED_2 the second.
+    `key`: rename the worker of this key instead (a key being replaced); nothing is saved for it."""
     name, why = check_name(name)
     if not name:
         return False, why
-    key = read_key(install, config)
+    given = bool(key)
+    key = key or read_key(install, config)
     if not key:
         return False, "This PC is not set up yet - choose Start now first."
     req = urllib.request.Request(base.rstrip("/") + "/api/worker/me", method="POST",
@@ -167,7 +172,7 @@ def rename(install, base, name, opener=open_url, timeout=10.0, now=None, config=
         if e.code in (404, 405):
             return False, "The site cannot rename workers yet. Try again after the next site update."
         if e.code == 409:
-            return False, "That name is taken. Pick another."
+            return False, TAKEN
         if e.code in (400, 422):
             return False, _error_text(e) or "The site did not accept that name."
         return False, "The site did not accept that name."
@@ -181,9 +186,32 @@ def rename(install, base, name, opener=open_url, timeout=10.0, now=None, config=
     if not isinstance(label, str) or not label.strip():
         return False, "The site's answer was not understood."
     tier = data.get("tier")
-    save(install, {"label": label.strip()[:80], "tier": tier if isinstance(tier, str) else ""},
-         time.time() if now is None else now, enrolled)
+    if not given:
+        save(install, {"label": label.strip()[:80], "tier": tier if isinstance(tier, str) else ""},
+             time.time() if now is None else now, enrolled)
     return True, f"Renamed to {label.strip()[:80]}"
+
+
+DEFAULT_LABEL = re.compile(r"^Worker \d+$")      # what the site names a new worker; not worth carrying across
+
+
+def carry_name(install, base, old_label, old_key, renamer=None):
+    """A text-upload-only key was just replaced by a GPU key (the site cannot upgrade one), and the new key came with a
+    new label. Give it the name the player had chosen. The old key still holds that name on the site, so when it is
+    taken the old one is renamed out of the way first ("<name> old"; it is unused and the site retires it after 30
+    idle days). -> True when the new key carries the old name. Best effort, never raises."""
+    renamer = renamer or rename
+    try:
+        if not old_label or DEFAULT_LABEL.match(old_label) or label_of(install) == old_label:
+            return False
+        ok, msg = renamer(install, base, old_label)
+        if not ok and msg == TAKEN and old_key:
+            freed, _ = renamer(install, base, old_label[:28].rstrip() + " old", key=old_key)
+            if freed:
+                ok, _ = renamer(install, base, old_label)
+        return ok
+    except Exception:
+        return False
 
 
 def match_second_name(install, base, renamer=None):
