@@ -55,6 +55,10 @@ MODEL_FILES = ("config.yaml", "gpt.pth", "s2mel.pth", "bpe.model")
 TORCH_VERSION = "2.8.0+cu128"
 WORKER_FILES = ("net_worker.py", "indextts2_worker.py", "runpod_worker.py")
 
+# Making voice lines switched off in the first-start menu: only what is needed for a worker key (the WoW-text upload
+# sends with it), a few hundred MB instead of about 20 GB. Turning the lines on later runs the rest.
+LIGHT_STEPS = ("folders", "worker_files", "uv", "python", "enroll")
+
 # torch comes before the engine so the engine install finds the pinned build already there and cannot swap it.
 STEPS = ("gpu", "folders", "worker_files", "uv", "python", "index_tts", "torch", "packages", "model", "extras", "ffmpeg",
          "enroll", "check")
@@ -106,6 +110,7 @@ class Env:
     api_base: str = ""                                  # only passed to the worker when it is not the default
     machine_name: str = ""
     probe: callable = None                              # (cmd list, timeout seconds) -> (exit code, output text); None = real
+    light: bool = False                                 # LIGHT_STEPS only (no voice engine): needs little disk
 
     @property
     def _exe(self):
@@ -427,7 +432,7 @@ def step_folders(env):
         d.mkdir(parents=True, exist_ok=True)
     # About 20 GB for a first install. Once the model is in place only the smaller pieces can be missing (the extra
     # voice files are about 2 GB, a lost Python with torch about 6 GB), so a repair run on a fuller drive still goes.
-    need = 8 if model_complete(env.model_dir) else 20
+    need = 1 if env.light else (8 if model_complete(env.model_dir) else 20)
     free = shutil.disk_usage(env.install).free
     if free < need * 1024 ** 3:
         raise SetupError(f"Only {free // 1024 ** 3} GB free on that drive; about {need} GB is needed.")
@@ -723,10 +728,12 @@ def second_worker_allowed(gpu):
 
 
 def enroll_second(env):
-    """Join the queue a second time as '<host>-2' and write worker_config_2.json. Kept if it already exists."""
+    """Join the queue a second time and write worker_config_2.json. Kept if it already exists. It joins under the same
+    name as the first worker (owner, 2026-11-25: both show as one PC on the network page; until 1.2.25 it was
+    '<host>-2'). The site still gives each its own key, since a key holds one job at a time."""
     if env.config_file_2.exists():
         return
-    name = (env.machine_name or "worker") + "-2"
+    name = env.machine_name or "worker"
     info = env.enroll(machine_name=name)
     key = info["key"]
     env.work_dir_2.mkdir(parents=True, exist_ok=True)
@@ -823,6 +830,11 @@ def verified_done(install, done):
     if "python" in done and "python" not in keep:
         keep -= {"torch", "packages", "check"}
     return keep
+
+
+def key_ready(install):
+    """True when this PC has a worker key, whether from the full setup or the light one."""
+    return config_has_key(Path(install) / "worker_config.json")
 
 
 def is_set_up(install):

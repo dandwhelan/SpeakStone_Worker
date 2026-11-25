@@ -20,20 +20,23 @@ RETRY_SECONDS = 30 * 60                # an unknown label is retried at most thi
 TIMEOUT = 2.0                          # never hold the menu for longer than this
 
 
-def read_key(install):
+CONFIG_2, ENROLLED_2 = "worker_config_2.json", "enrolled_2.json"     # the second worker on the same card
+
+
+def read_key(install, config="worker_config.json"):
     try:
-        key = json.loads((Path(install) / "worker_config.json").read_text(encoding="utf-8")).get("worker_key")
+        key = json.loads((Path(install) / config).read_text(encoding="utf-8")).get("worker_key")
     except (OSError, ValueError, AttributeError):
         return ""
     return key if isinstance(key, str) else ""
 
 
-def cached(install):
+def cached(install, enrolled="enrolled.json"):
     """What is saved: {"label", "tier", "checked_at", ...} (empty when nothing is)."""
     if not install:
         return {}
     try:
-        d = json.loads((Path(install) / "enrolled.json").read_text(encoding="utf-8"))
+        d = json.loads((Path(install) / enrolled).read_text(encoding="utf-8"))
         return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -72,12 +75,12 @@ def fetch(base, key, opener=open_url, timeout=TIMEOUT):
     return {"label": data["label"].strip()[:80], "tier": tier if isinstance(tier, str) else ""}
 
 
-def save(install, info, now):
+def save(install, info, now, enrolled="enrolled.json"):
     """Merge label and tier into enrolled.json (keeping worker_id and the rest). Never touches the key."""
-    d = dict(cached(install))
+    d = dict(cached(install, enrolled))
     d.update({"label": info["label"], "tier": info.get("tier") or d.get("tier"), "checked_at": now})
     d.pop("key", None)
-    path = Path(install) / "enrolled.json"
+    path = Path(install) / enrolled
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -135,12 +138,14 @@ def _error_text(err):
         return ""
 
 
-def rename(install, base, name, opener=open_url, timeout=10.0, now=None):
-    """POST the new label. -> (True, "Renamed to X") or (False, sentence in plain words). Never includes the key."""
+def rename(install, base, name, opener=open_url, timeout=10.0, now=None, config="worker_config.json",
+           enrolled="enrolled.json"):
+    """POST the new label. -> (True, "Renamed to X") or (False, sentence in plain words). Never includes the key.
+    `config` / `enrolled` pick the worker: the defaults are the first one, CONFIG_2 / ENROLLED_2 the second."""
     name, why = check_name(name)
     if not name:
         return False, why
-    key = read_key(install)
+    key = read_key(install, config)
     if not key:
         return False, "This PC is not set up yet - choose Start now first."
     req = urllib.request.Request(base.rstrip("/") + "/api/worker/me", method="POST",
@@ -172,5 +177,18 @@ def rename(install, base, name, opener=open_url, timeout=10.0, now=None):
         return False, "The site's answer was not understood."
     tier = data.get("tier")
     save(install, {"label": label.strip()[:80], "tier": tier if isinstance(tier, str) else ""},
-         time.time() if now is None else now)
+         time.time() if now is None else now, enrolled)
     return True, f"Renamed to {label.strip()[:80]}"
+
+
+def match_second_name(install, base, renamer=None):
+    """The second worker on this card carries the same name as the first (owner, 2026-11-25). When the site gave it
+    another label (or the first was renamed since), ask the site to use the first one's. -> True when the two now
+    match. Best effort: no key, no label, a refusal or no connection all leave it as it was."""
+    first = label_of(install)
+    if not first or not read_key(install, CONFIG_2):
+        return False
+    if str(cached(install, ENROLLED_2).get("label") or "") == first:
+        return True
+    ok, _ = (renamer or rename)(install, base, first, config=CONFIG_2, enrolled=ENROLLED_2)
+    return ok

@@ -16,7 +16,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markup import escape
 
-from . import (APP_NAME, __version__, addons, board, identity, wowtext, locking, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
+from . import (APP_NAME, __version__, addons, board, firstrun, identity, wowtext, locking, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
                stats, tray as tray_mod, uninstall, update)
 from .keys import KeyReader, drain
 from .runner import WorkerGroup, install_close_handlers
@@ -162,8 +162,10 @@ def ask_site_for_label(install, wait=identity.TIMEOUT, opener=None, force=False)
 
 
 # ---------------------------------------------------------------- setup with a progress board
-def run_setup_ui(console, install, base):
-    steps, done, cur = list(setup.STEPS), set(setup.load_state(setup.Env(install, paths.resource_dir()))), [None]
+def run_setup_ui(console, install, base, only=None):
+    """`only`: run just these steps (setup.LIGHT_STEPS: a worker key without the voice engine)."""
+    steps = list(only or setup.STEPS)
+    done, cur = set(setup.load_state(setup.Env(install, paths.resource_dir()))) & set(steps), [None]
     # Two steps can now run at once (setup.LANE_A / LANE_B), so each active step keeps its own bar, line and speed,
     # and the board shows the most recently updated one with the other's short status on the same line.
     ui_lock = threading.RLock()
@@ -232,11 +234,11 @@ def run_setup_ui(console, install, base):
 
     env = setup.Env(install, paths.resource_dir(), download=download, run=setup.real_run, enroll=do_enroll,
                     gpu_total_mib=stats.gpu_total_mib, progress=progress, api_base=(api if os.environ.get("SPEAKSTONE_API_BASE") else ""),
-                    machine_name=host)
+                    machine_name=host, light=bool(only))
     with live:
         redraw()
         try:
-            setup.run_setup(env)
+            setup.run_setup(env, only=only)
         except (setup.SetupError, enroll_mod.EnrollError) as e:
             redraw(error=str(e))
             return str(e)
@@ -251,7 +253,18 @@ def run_setup_ui(console, install, base):
     return None
 
 
-def ensure_setup(console, install):
+def ensure_setup(console, install, st=None):
+    """Full setup when this PC makes voice lines. With making lines off (first-start menu or Settings [G]): only the
+    light setup for a worker key, and only when the WoW text is to be sent; nothing at all otherwise. -> True when the
+    caller can go on (with lines off that is always: the add-on updates need nothing from setup)."""
+    if st is not None and not _setting(st, "make_lines", True):
+        if _setting(st, "send_wow_text", True) and not setup.key_ready(install):
+            err = run_setup_ui(console, install, os.environ, only=setup.LIGHT_STEPS)
+            if err:
+                console.print(f"\n[#e0962c]Could not get this PC a key for sending WoW text: {err}[/]\n"
+                              "The add-on updates still work. Run this again to try once more.")
+                time.sleep(4)
+        return True
     if setup.is_set_up(install) and not setup.extras_cached(install):
         setup.forget_extras(install)             # setup says done but the cache lost the files: fetch them once, with a bar
     if setup.is_set_up(install):
@@ -261,6 +274,20 @@ def ensure_setup(console, install):
         console.print(f"\n[#e0962c]Setup stopped: {err}[/]\nRun this again to carry on from where it stopped.")
         return False
     return True
+
+
+def add_wanted_second_worker(console, install, st, enroll_runner=None, gpu_reader=None):
+    """Two workers were chosen in the first-start menu, before there was a setup to add the second to: add it now,
+    once. -> the sentence shown, or None when nothing was wanted."""
+    if not _setting(st, "two_workers_wanted", False):
+        return None
+    st["two_workers_wanted"] = False             # asked once: a refusal is shown, and Settings [5] can try again
+    if st["workers"] == 2:
+        return None
+    msg = set_workers(console, install, st, gpu_reader=gpu_reader, enroll_runner=enroll_runner)
+    console.print(msg)
+    time.sleep(2)
+    return msg
 
 
 # ---------------------------------------------------------------- live board
@@ -341,8 +368,14 @@ def start_now(console, install, settings, flow=None, keep=None, respect_pause=Fa
     """The working board. `keep` holds the worker between the board and the menu, so [M] stops nothing and coming back
     does not start a second one. `respect_pause`: an active pause set from the tray shows the board paused."""
     keep = keep if keep is not None else {}
+    if not _setting(settings, "make_lines", True):
+        console.print("Making voice lines is off on this PC (Settings [G]). The add-on updates and the WoW text "
+                      "carry on in the background service (menu [2]).")
+        time.sleep(3)
+        return "menu"
     if not ensure_setup(console, install):
         return "menu"
+    add_wanted_second_worker(console, install, settings)
     fresh_screen(console)
     setup.sync_worker_files(install, paths.resource_dir())
     runner = keep.get("runner")
@@ -681,6 +714,8 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
         console.print(f"  [{board.GOLD}][8][/] Start making lines when the app opens: "
                       f"[bold]{'on' if st['start_on_open'] else 'off'}[/]")
         console.print(f"  [{board.GOLD}][9][/] Update now (this is version [bold]{__version__}[/])")
+        console.print(f"  [{board.GOLD}][G][/] Lend my graphics card (make voice lines when idle): "
+                      f"[bold]{'on' if _setting(st, 'make_lines', True) else 'off'}[/]")
         console.print(f"  [{board.GOLD}][W][/] Send my captured WoW text automatically: "
                       f"[bold]{'on' if st['send_wow_text'] else 'off'}[/]")
         console.print(f"  [{board.GOLD}][A][/] Keep my SpeakStone add-ons up to date: "
@@ -700,6 +735,9 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             time.sleep(3)
         elif k == "8":
             st["start_on_open"] = not st["start_on_open"]
+        elif k == "g":
+            console.print(toggle_make_lines(st))
+            time.sleep(2.5)
         elif k == "w":
             st["send_wow_text"] = not st["send_wow_text"]
         elif k == "a":
@@ -753,6 +791,18 @@ def settings_menu(console, install, st, flow=None, working=lambda: False):
             return
 
 
+def toggle_make_lines(st, gpu=None):
+    """Settings [G]. Turning it on needs an NVIDIA card of 8 GB or more. -> the sentence to show."""
+    if _setting(st, "make_lines", True):
+        st["make_lines"] = False
+        return "Making voice lines is off. A job in hand is finished first; nothing more is taken."
+    gpu = gpu or firstrun.gpu_facts()
+    if not gpu["ok"]:
+        return gpu["why"]
+    st["make_lines"] = True
+    return "Making voice lines is on. Choose Start now to finish the setup (about 20 GB) if it has not run yet."
+
+
 def send_wow_text_now(console, install, st, sender=wowtext.collect_and_send, wait=input):
     """Menu [4]: read the SpeakStone add-on's saved text from this PC's WoW folder and send what is new."""
     key = identity.read_key(install)
@@ -786,6 +836,11 @@ def rename_flow(console, install, ask=input, renamer=identity.rename):
     if not name:
         return why
     ok, msg = renamer(install, paths.api_base(), name)
+    if ok and identity.read_key(install, identity.CONFIG_2):      # the second worker keeps the same name
+        try:
+            identity.match_second_name(install, paths.api_base())
+        except Exception:
+            pass
     return msg
 
 
@@ -848,6 +903,10 @@ def enroll_second_worker(install):
     env = setup.Env(install, paths.resource_dir(), run=setup.real_run, enroll=do_enroll,
                     api_base=(api if os.environ.get("SPEAKSTONE_API_BASE") else ""), machine_name=host)
     setup.enroll_second(env)
+    try:                                         # same label as the first worker, when the site gave it another
+        identity.match_second_name(install, api)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- background mode
@@ -1173,6 +1232,26 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
     if not runner.running:
         runner.stop_asked_at = 0.0
     return action
+
+
+LINES_OFF = "Making voice lines is off (Settings)"
+
+
+def lines_off_tick(runner, control):
+    """One background turn with making lines switched off: a running worker finishes its job and leaves (nothing is
+    handed back), no new one starts. The add-on updates and the WoW text run on their own thread regardless."""
+    if runner.running and control.drain_reason is None:
+        runner.request_drain()
+        control.drain_reason = "lines_off"
+    runner.poll_stop()
+    if not runner.running:
+        if control.drain_reason == "lines_off":
+            runner.clear_drain()
+            control.drain_reason = None
+        control.status = LINES_OFF
+    else:
+        control.status = control_mod.PAUSING
+    return "drain" if runner.running else "off"
 
 
 def apply_worker_count(runner, st):
@@ -1620,15 +1699,17 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
     idle_reason = idle_reason or idle_reason_now
     hide_console()
     set_title(window_title("background"))
-    if setup.is_set_up(install) and not setup.extras_cached(install):
+    lines_on = _setting(st, "make_lines", True)
+    if lines_on and setup.is_set_up(install) and not setup.extras_cached(install):
         setup.forget_extras(install)
         try:
             setup.run_setup(setup.Env(install, paths.resource_dir(), run=setup.real_run), only=("extras",))
         except setup.SetupError:
             return 2
-    if not setup.is_set_up(install):
+    if lines_on and not setup.is_set_up(install):
         return 2
-    setup.sync_worker_files(install, paths.resource_dir())
+    if setup.worker_files_ok(install) or setup.is_set_up(install):
+        setup.sync_worker_files(install, paths.resource_dir())
     log = lambda text: log_background_error(install, text)
     # Settings [W]: send the add-on's captured text from WoW now and then (does nothing while the setting is off).
     # Settings [A]: before each look, update the installed SpeakStone add-ons when one is due (updates run first, so
@@ -1673,7 +1754,14 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
                     next_label = time.time() + (identity.REFRESH_SECONDS if worker_label(install) else identity.RETRY_SECONDS)
                     ask_site_for_label(install)
                 pause_expiry_step(control, st)
-                background_tick(runner, st, gate=gate, control=control)    # first: claim at once when the rules allow
+                lines_on = _setting(st, "make_lines", True)
+                if lines_on and control.drain_reason == "lines_off":     # turned on again before the job ended
+                    runner.clear_drain()
+                    control.drain_reason = None
+                if lines_on:
+                    background_tick(runner, st, gate=gate, control=control)    # first: claim at once when the rules allow
+                else:                                   # Settings [G] off: finish a job in hand, take no new one
+                    lines_off_tick(runner, control)
                 foreign = not runner.running and _busy(runner)      # making lines, but started in the app window
                 service_follow_step(flow, runner, follow, install, note)     # the window updated the program: follow it
                 try:
@@ -1686,11 +1774,12 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
                     making_now, last_making = making(install, st["workers"]), time.time()
                     lines_now = job_lines(install, st["workers"]) if foreign else 0
                     reason_now = idle_reason(install, st["workers"]) if not making_now else None
-                control.status = control_mod.status_for(runner.running or foreign, making_now and (runner.running or foreign),
-                                                        control.paused, drain=control.drain_reason,
-                                                        until=control.paused_until, foreign=foreign, lines=lines_now,
-                                                        idle_reason=reason_now,
-                                                        broken=BROKEN_SENTENCE if latched_now(runner, gate) else None)
+                if lines_on:                            # off: lines_off_tick has set the status
+                    control.status = control_mod.status_for(runner.running or foreign, making_now and (runner.running or foreign),
+                                                            control.paused, drain=control.drain_reason,
+                                                            until=control.paused_until, foreign=foreign, lines=lines_now,
+                                                            idle_reason=reason_now,
+                                                            broken=BROKEN_SENTENCE if latched_now(runner, gate) else None)
             except Exception as e:                  # one odd tick must not end the service
                 log(f"tick failed: {type(e).__name__}: {e}")
             time.sleep(5)
@@ -1711,7 +1800,7 @@ def _background(install, st, note, flow, tray_start, making, job_lines=None, idl
 def auto_start_wanted(menu, start, st, install, is_set_up=None, read_key=None):
     """A plain start (no arguments) on a finished setup that has a key goes straight to making lines. --menu or the
     Settings toggle turns it off; --start is its own explicit request."""
-    if menu or start or not _setting(st, "start_on_open", True):
+    if menu or start or not _setting(st, "start_on_open", True) or not _setting(st, "make_lines", True):
         return False
     return bool((is_set_up or setup.is_set_up)(install) and (read_key or identity.read_key)(install))
 
@@ -1786,6 +1875,12 @@ def main(argv=None):
     if not update.disabled():                          # a short, silent look in the background; never blocks the menu
         looker = threading.Thread(target=lambda: safe_check(flow, install), daemon=True)
         looker.start()
+    if firstrun.wanted(st, setup.is_set_up(install)):      # a new PC: pick the jobs before anything is downloaded
+        fresh_screen(console)
+        console.print("Looking at this PC's graphics card...")
+        picked = firstrun.run(console, st, KeyReader, clear=fresh_screen)
+    else:
+        picked = None
     auto_tried = False
     keep = {"runner": None}                            # the worker a window keeps while the menu is showing
     # a plain start on a finished setup with a key goes straight to making lines; --menu or the setting turns it off
@@ -1793,6 +1888,8 @@ def main(argv=None):
     first = a.start or auto                            # the first start respects a pause set from the tray
     try:
         choice = "1" if (a.start or auto) else None
+        if picked is not None and not a.menu:         # straight on with what was chosen in the first-start menu
+            choice = firstrun.next_choice(picked, service.is_installed())
         while True:
             if choice is None:
                 if looker:
@@ -1825,7 +1922,9 @@ def main(argv=None):
                     console.print(gone.sentence("Could not remove the service."))
                     if not gone:
                         time.sleep(8)                    # the explanation is long: give it time to be read
-                elif ensure_setup(console, install):
+                elif ensure_setup(console, install, st):
+                    if _setting(st, "make_lines", True):
+                        add_wanted_second_worker(console, install, st)
                     ok = service.install(install)
                     console.print(ok.sentence(st["idle_minutes"]) if hasattr(ok, "sentence") else (
                         f"Installed. It starts when your PC has been idle for {st['idle_minutes']} minutes." if ok else

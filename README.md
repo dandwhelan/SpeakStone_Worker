@@ -53,7 +53,9 @@ closer to the game. Every helper makes that happen sooner.
 
 1. [Download the Worker](https://github.com/dandwhelan/SpeakStone_Worker/releases/latest/download/SpeakStoneWorker-windows.exe)
    and run it. There is nothing to install by hand.
-2. The first start sets everything up by itself: it downloads the voice engine and its files (about 20 GB of disk
+2. The first start asks which of the three jobs you want (add-on updates, sending WoW text, lending your graphics
+   card). Lending the card is only offered with an NVIDIA card of 8 GB or more; on a 16 GB card it suggests running
+   two workers, which share one name on the network page. Then it sets up what you chose by itself: it downloads the voice engine and its files (about 20 GB of disk
    in all) and joins the queue. No account and no sign-up.
 3. That's it. It runs quietly in the background from then on, and the window shows what it is doing whenever you
    open it.
@@ -79,6 +81,7 @@ The Worker is built to never get in your way.
 |---|---|---|
 | `[1]` Idle minutes | How long the PC must be idle before it starts | 10 |
 | `[2]` Daily pause | A time window when it never works | none |
+| `[G]` Lend my graphics card | Job 3 (NVIDIA only) | on |
 | `[W]` Send my captured WoW text | Job 2 | on |
 | `[A]` Keep my add-ons up to date | Job 1 | on |
 | `[7]` Update automatically | Keeps the Worker itself up to date | on |

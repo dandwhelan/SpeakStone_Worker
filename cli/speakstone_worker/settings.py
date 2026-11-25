@@ -22,6 +22,10 @@ DEFAULTS = {
     "update_addons": True,      # keep the SpeakStone add-ons already installed in WoW up to date (addons.py)
     "wow_folder": "",           # WoW install folder, when it is not in a usual place; blank = look for it
     "wow_text_on_v2": False,    # internal: the one-time switch-on of send_wow_text (owner 2026-11-24) has been done
+    "make_lines": True,         # lend the graphics card: make voice lines from the shared queue when the PC is idle
+    "first_run_done": False,    # the first-start feature menu (firstrun.py) has been answered
+    "two_workers_wanted": False,  # chosen in the first-start menu before setup: add the second worker once setup ends
+    "first_run_v1": False,      # internal: PCs set up before the first-start menu existed are never shown it
 }
 # Settings whose default changed after release. A cli.json written by an older version holds the old default for every
 # key (save() writes them all), so a new default alone would never reach an existing PC. Each entry switches the key
@@ -29,6 +33,7 @@ DEFAULTS = {
 #   marker key -> (setting, new value)
 MIGRATIONS = {
     "wow_text_on_v2": ("send_wow_text", True),   # owner 2026-11-24: send captured WoW text automatically by default
+    "first_run_v1": ("first_run_done", True),    # 1.2.26: an existing PC already chose; only a new install sees the menu
 }
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 

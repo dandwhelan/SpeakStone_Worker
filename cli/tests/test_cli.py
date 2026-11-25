@@ -760,7 +760,7 @@ def test_second_worker_gate():
     assert not setup.second_worker_allowed(None)[0]
 
 
-def test_enroll_second_uses_own_name_key_config_and_work_dir(tmp_path):
+def test_enroll_second_uses_same_name_own_key_config_and_work_dir(tmp_path):
     calls, names = [], []
     env = make_env(tmp_path, calls, [])
     env.install.mkdir(parents=True, exist_ok=True)
@@ -781,11 +781,11 @@ def test_enroll_second_uses_own_name_key_config_and_work_dir(tmp_path):
     env.run = run
     setup.enroll_second(env)
     init = [(c, e) for c, e in calls if "init" in c][0]
-    assert names == ["LAPTOP-2"]
+    assert names == ["LAPTOP"]                                             # same name as worker 1 (1.2.26)
     assert "worker_config_2.json" in " ".join(init[0]) and "work_2" in " ".join(init[0])
     assert init[1]["SSW_WORKER_KEY"] == KEY and KEY not in " ".join(init[0])
     setup.enroll_second(env)                                               # key kept: no second sign-up
-    assert names == ["LAPTOP-2"]
+    assert names == ["LAPTOP"]                                             # same name as worker 1 (1.2.26)
 
 
 def test_set_workers_gate_toggle_and_429_message(tmp_path, monkeypatch):
