@@ -687,8 +687,9 @@ def step_ffmpeg(env):
 
 
 def step_enroll(env):
-    """Ask the site for a key and hand it straight to `net_worker.py init` (child environment only)."""
-    if config_has_key(env.config_file):
+    """Ask the site for a key and hand it straight to `net_worker.py init` (child environment only). A text-upload-only
+    key from the light setup is kept by the light setup and replaced by the full one (the site cannot upgrade it)."""
+    if config_has_key(env.config_file) and (env.light or not text_key(env.install)):
         return
     try:                                    # an empty or broken file is not a key: join again instead of waiting forever
         Path(env.config_file).unlink()
@@ -706,7 +707,8 @@ def step_enroll(env):
     if not env.config_file.exists():
         raise SetupError("The worker key was not accepted by the worker. Please try again.")
     env.enrolled_file.write_text(json.dumps({"worker_id": info.get("worker_id"), "label": info.get("label"),
-                                             "tier": info.get("tier")}), encoding="utf-8")
+                                             "tier": info.get("tier"), "purpose": info.get("purpose") or "gpu"}),
+                                 encoding="utf-8")
     env.progress("enroll", 1, f"Joined the queue as {info.get('label') or 'a new worker'}")
 
 
@@ -819,8 +821,8 @@ def artifact_ok(install, name):
     if name == "ffmpeg":
         return _big_enough([i / "ffmpeg" / "ffmpeg.exe", i / "ffmpeg" / "ffmpeg"], MIN_TOOL_BYTES) or (
             sys.platform != "win32" and shutil.which("ffmpeg") is not None)
-    if name == "enroll":
-        return config_has_key(i / "worker_config.json")
+    if name == "enroll":                         # a text-only key does not finish the full setup: it is replaced
+        return config_has_key(i / "worker_config.json") and not text_key(i)
     return True
 
 
@@ -830,6 +832,14 @@ def verified_done(install, done):
     if "python" in done and "python" not in keep:
         keep -= {"torch", "packages", "check"}
     return keep
+
+
+def text_key(install):
+    """True when this PC's key is a text-upload-only one (enrolled.json "purpose", from the enrol or GET /me)."""
+    try:
+        return json.loads((Path(install) / "enrolled.json").read_text(encoding="utf-8")).get("purpose") == "text"
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def key_ready(install):

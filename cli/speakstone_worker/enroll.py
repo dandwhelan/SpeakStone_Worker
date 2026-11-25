@@ -35,6 +35,9 @@ def _error_code(err):
 
 
 PURPOSE_TEXT = "text"      # a key only for sending captured WoW text: this PC makes no voice lines (any graphics card)
+PURPOSE_GPU = "gpu"        # an ordinary key: makes voice lines (and sends text). A text key cannot become one: enrol again
+# The site (2026-11-25): a text key may use harvest and /me only; claim, heartbeat, upload-urls, complete and fail
+# answer 403 {"code": "text_only"}.
 
 
 def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener=open_url, timeout=30, purpose=None):
@@ -43,11 +46,15 @@ def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opene
     NVIDIA PC, so nothing is worse than before."""
     if purpose:
         try:
-            return _enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener, timeout, purpose)
+            info = _enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener, timeout, purpose)
+            info["purpose"] = purpose               # the site's answer does not echo it
+            return info
         except _Refused422:
             pass
     try:
-        return _enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener, timeout, None)
+        info = _enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener, timeout, None)
+        info["purpose"] = PURPOSE_GPU
+        return info
     except _Refused422 as e:
         raise EnrollError(e.args[0]) from None
 

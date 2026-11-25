@@ -311,3 +311,65 @@ def test_a_refused_ordinary_enrol_still_says_why():
         enroll.enroll("https://x", "PC", "AMD", 0, "linux", "1.2.26", opener=opener, purpose="text")
     with pytest.raises(enroll.EnrollError, match="8 GB"):
         enroll.enroll("https://x", "PC", "AMD", 0, "linux", "1.2.26", opener=opener)
+
+
+# ---- what kind of key this PC holds (site contract 2026-11-25)
+def test_enrol_reports_which_kind_of_key_it_got():
+    from speakstone_worker import enroll
+    ok = lambda req, timeout: _Resp({"key": "sswk_" + "a" * 43, "label": "Worker 9"})
+    assert enroll.enroll("https://x", "PC", "AMD", 0, "linux", "1.2.26", opener=ok, purpose="text")["purpose"] == "text"
+    assert enroll.enroll("https://x", "PC", "RTX", 8192, "linux", "1.2.26", opener=ok)["purpose"] == "gpu"
+
+    def old_site(req, timeout):
+        if "purpose" in json.loads(req.data):
+            raise _http_error(422, {"code": "gpu_too_small"})
+        return _Resp({"key": "sswk_" + "a" * 43, "label": "Worker 9"})
+    assert enroll.enroll("https://x", "PC", "RTX", 8192, "linux", "1.2.26", opener=old_site,
+                         purpose="text")["purpose"] == "gpu"          # fell back: an ordinary key
+
+
+def _keyed(inst, purpose):
+    inst.mkdir(parents=True, exist_ok=True)
+    (inst / "worker_config.json").write_text(json.dumps({"worker_key": "sswk_" + "t" * 43}))
+    (inst / "enrolled.json").write_text(json.dumps({"label": "Worker 9", "purpose": purpose}))
+
+
+def test_a_text_key_does_not_count_as_a_finished_full_setup(tmp_path):
+    _keyed(tmp_path, "text")
+    assert setup.text_key(tmp_path) and setup.key_ready(tmp_path)
+    assert not setup.artifact_ok(tmp_path, "enroll")
+    _keyed(tmp_path, "gpu")
+    assert not setup.text_key(tmp_path) and setup.artifact_ok(tmp_path, "enroll")
+
+
+def test_turning_lines_on_replaces_a_text_key_with_a_gpu_key(tmp_path):
+    inst = tmp_path / "inst"
+    _keyed(inst, "text")
+    asked = []
+
+    def enr(machine_name=None):
+        asked.append(1)
+        return {"key": "sswk_" + "g" * 43, "label": "Worker 9", "purpose": "gpu", "tier": "public"}
+
+    def run(cmd, e, cwd, on_line):
+        (inst / "worker_config.json").write_text(json.dumps({"worker_key": e["SSW_WORKER_KEY"]}))
+        return 0
+    light = setup.Env(inst, tmp_path, run=run, enroll=enr, light=True, base_env={})
+    setup.step_enroll(light)
+    assert asked == []                                               # the light setup keeps its text key
+    full = setup.Env(inst, tmp_path, run=run, enroll=enr, base_env={})
+    setup.step_enroll(full)
+    assert asked == [1] and not setup.text_key(inst)
+    assert json.loads((inst / "worker_config.json").read_text())["worker_key"].startswith("sswk_g")
+
+
+def test_me_answer_records_the_kind_of_key(tmp_path):
+    ME = {"worker": {"label": "Worker 9", "tier": "public", "purpose": "text"}}
+    got = identity.fetch("https://x", "k", opener=lambda req, timeout: _MeResp(ME))
+    assert got["purpose"] == "text"
+    identity.save(tmp_path, got, 0)
+    assert setup.text_key(tmp_path)
+
+
+class _MeResp(_Resp):
+    status = 200

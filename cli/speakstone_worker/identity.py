@@ -72,13 +72,18 @@ def fetch(base, key, opener=open_url, timeout=TIMEOUT):
     if not isinstance(data, dict) or not isinstance(data.get("label"), str) or not data["label"].strip():
         return None
     tier = data.get("tier")
-    return {"label": data["label"].strip()[:80], "tier": tier if isinstance(tier, str) else ""}
+    out = {"label": data["label"].strip()[:80], "tier": tier if isinstance(tier, str) else ""}
+    if data.get("purpose") in ("gpu", "text"):          # the site says which kind of key this is (2026-11-25)
+        out["purpose"] = data["purpose"]
+    return out
 
 
 def save(install, info, now, enrolled="enrolled.json"):
     """Merge label and tier into enrolled.json (keeping worker_id and the rest). Never touches the key."""
     d = dict(cached(install, enrolled))
     d.update({"label": info["label"], "tier": info.get("tier") or d.get("tier"), "checked_at": now})
+    if info.get("purpose"):
+        d["purpose"] = info["purpose"]
     d.pop("key", None)
     path = Path(install) / enrolled
     try:
