@@ -250,3 +250,64 @@ def test_second_worker_is_renamed_to_the_first_ones_label(tmp_path):
 def test_no_second_worker_no_rename(tmp_path):
     (tmp_path / "enrolled.json").write_text(json.dumps({"label": "Dusk Hollow"}))
     assert not identity.match_second_name(tmp_path, "https://x", renamer=lambda *a, **k: (True, ""))
+
+
+# ---- a text-upload-only key (light setup)
+class _Resp:
+    status = 201
+
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+    def read(self, n):
+        return json.dumps(self.body).encode()
+
+
+def _http_error(code, body):
+    import io
+    import urllib.error
+    return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(json.dumps(body).encode()))
+
+
+def test_text_only_enrol_sends_the_purpose(tmp_path):
+    from speakstone_worker import enroll
+    sent = []
+
+    def opener(req, timeout):
+        sent.append(json.loads(req.data))
+        return _Resp({"key": "sswk_" + "a" * 43, "label": "Calm Heron"})
+    enroll.enroll("https://x", "PC", "AMD Radeon", 0, "windows", "1.2.26", opener=opener, purpose=enroll.PURPOSE_TEXT)
+    assert sent == [{"machine_name": "PC", "gpu": "AMD Radeon", "vram_mib": 0, "os": "windows",
+                     "worker_version": "1.2.26", "purpose": "text"}]
+
+
+def test_a_site_without_text_keys_falls_back_to_the_ordinary_enrol():
+    from speakstone_worker import enroll
+    sent = []
+
+    def opener(req, timeout):
+        body = json.loads(req.data)
+        sent.append(body)
+        if "purpose" in body:
+            raise _http_error(422, {"code": "bad_request"})
+        return _Resp({"key": "sswk_" + "a" * 43, "label": "Calm Heron"})
+    got = enroll.enroll("https://x", "PC", "RTX 3070", 8192, "linux", "1.2.26", opener=opener, purpose="text")
+    assert got["label"] == "Calm Heron" and len(sent) == 2 and "purpose" not in sent[1]
+
+
+def test_a_refused_ordinary_enrol_still_says_why():
+    from speakstone_worker import enroll
+    import pytest
+
+    def opener(req, timeout):
+        raise _http_error(422, {"code": "gpu_too_small"})
+    with pytest.raises(enroll.EnrollError, match="8 GB"):
+        enroll.enroll("https://x", "PC", "AMD", 0, "linux", "1.2.26", opener=opener, purpose="text")
+    with pytest.raises(enroll.EnrollError, match="8 GB"):
+        enroll.enroll("https://x", "PC", "AMD", 0, "linux", "1.2.26", opener=opener)
