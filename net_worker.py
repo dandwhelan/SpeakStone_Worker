@@ -45,7 +45,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.2.25"
+WORKER_VERSION = "1.2.26"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
@@ -966,6 +966,9 @@ class Api:
             raise ExitRun(EXIT_KEY, "key refused")
         if status == 426:
             raise ExitRun(EXIT_PROTOCOL, "protocol refused")
+        if status == 403 and self._parse(body).get("code") == "text_only":
+            # a text-upload-only key (the app's light setup) can never take a job: stop, do not ask again
+            raise ExitRun(EXIT_KEY, "this key can only upload text")
         if status == 429:
             raise NetError(f"HTTP {status}", retry_after=retry_after_seconds(headers, self._parse(body)))
         if status >= 500 or status == 408:

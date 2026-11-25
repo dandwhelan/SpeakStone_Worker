@@ -55,6 +55,10 @@ MODEL_FILES = ("config.yaml", "gpt.pth", "s2mel.pth", "bpe.model")
 TORCH_VERSION = "2.8.0+cu128"
 WORKER_FILES = ("net_worker.py", "indextts2_worker.py", "runpod_worker.py")
 
+# Making voice lines switched off in the first-start menu: only what is needed for a worker key (the WoW-text upload
+# sends with it), a few hundred MB instead of about 20 GB. Turning the lines on later runs the rest.
+LIGHT_STEPS = ("folders", "worker_files", "uv", "python", "enroll")
+
 # torch comes before the engine so the engine install finds the pinned build already there and cannot swap it.
 STEPS = ("gpu", "folders", "worker_files", "uv", "python", "index_tts", "torch", "packages", "model", "extras", "ffmpeg",
          "enroll", "check")
@@ -106,6 +110,8 @@ class Env:
     api_base: str = ""                                  # only passed to the worker when it is not the default
     machine_name: str = ""
     probe: callable = None                              # (cmd list, timeout seconds) -> (exit code, output text); None = real
+    light: bool = False                                 # LIGHT_STEPS only (no voice engine): needs little disk
+    carry_name: callable = None                         # (old label, old key) -> bool: a replaced text key's name
 
     @property
     def _exe(self):
@@ -427,7 +433,7 @@ def step_folders(env):
         d.mkdir(parents=True, exist_ok=True)
     # About 20 GB for a first install. Once the model is in place only the smaller pieces can be missing (the extra
     # voice files are about 2 GB, a lost Python with torch about 6 GB), so a repair run on a fuller drive still goes.
-    need = 8 if model_complete(env.model_dir) else 20
+    need = 1 if env.light else (8 if model_complete(env.model_dir) else 20)
     free = shutil.disk_usage(env.install).free
     if free < need * 1024 ** 3:
         raise SetupError(f"Only {free // 1024 ** 3} GB free on that drive; about {need} GB is needed.")
@@ -682,9 +688,17 @@ def step_ffmpeg(env):
 
 
 def step_enroll(env):
-    """Ask the site for a key and hand it straight to `net_worker.py init` (child environment only)."""
-    if config_has_key(env.config_file):
+    """Ask the site for a key and hand it straight to `net_worker.py init` (child environment only). A text-upload-only
+    key from the light setup is kept by the light setup and replaced by the full one (the site cannot upgrade it)."""
+    if config_has_key(env.config_file) and (env.light or not text_key(env.install)):
         return
+    old_label = old_key = ""
+    if text_key(env.install):                    # being replaced: keep its name and key to carry the name across
+        try:
+            old_label = str(json.loads(env.enrolled_file.read_text(encoding="utf-8")).get("label") or "")
+            old_key = json.loads(Path(env.config_file).read_text(encoding="utf-8")).get("worker_key") or ""
+        except (OSError, ValueError, AttributeError):
+            pass
     try:                                    # an empty or broken file is not a key: join again instead of waiting forever
         Path(env.config_file).unlink()
     except OSError:
@@ -701,13 +715,17 @@ def step_enroll(env):
     if not env.config_file.exists():
         raise SetupError("The worker key was not accepted by the worker. Please try again.")
     env.enrolled_file.write_text(json.dumps({"worker_id": info.get("worker_id"), "label": info.get("label"),
-                                             "tier": info.get("tier")}), encoding="utf-8")
+                                             "tier": info.get("tier"), "purpose": info.get("purpose") or "gpu"}),
+                                 encoding="utf-8")
+    if old_label and env.carry_name and env.carry_name(old_label, old_key):
+        info["label"] = old_label
+    old_key = ""
     env.progress("enroll", 1, f"Joined the queue as {info.get('label') or 'a new worker'}")
 
 
 # Two workers on one card: each is an ordinary one-lease worker with its own key (the site limits a key to one lease,
 # so sharing a key would hand the second process the first one's job).
-MIN_TOTAL_MIB_FOR_TWO = 12000            # a "12 GB" card reports 12282-12288 MiB
+MIN_TOTAL_MIB_FOR_TWO = 15500            # 16 GB+ (owner 2026-11-25; 12 GB until 1.2.25): a "16 GB" card reports 16303-16384 MiB
 MIN_FREE_MIB_FOR_TWO = 10000             # about 5 GB for each process; "10 GB" cards report a little under 10240
 
 
@@ -716,17 +734,19 @@ def second_worker_allowed(gpu):
     if not gpu:
         return False, "No NVIDIA graphics card was found."
     if gpu.get("mem_total_mib", 0) < MIN_TOTAL_MIB_FOR_TWO:
-        return False, "Two workers need a graphics card with at least 12 GB of memory."
+        return False, "Two workers need a graphics card with at least 16 GB of memory."
     if gpu["mem_total_mib"] - gpu.get("mem_used_mib", 0) < MIN_FREE_MIB_FOR_TWO:
         return False, "Two workers need about 10 GB of free graphics memory right now. Close other programs and try again."
     return True, ""
 
 
 def enroll_second(env):
-    """Join the queue a second time as '<host>-2' and write worker_config_2.json. Kept if it already exists."""
+    """Join the queue a second time and write worker_config_2.json. Kept if it already exists. It joins under the same
+    name as the first worker (owner, 2026-11-25: both show as one PC on the network page; until 1.2.25 it was
+    '<host>-2'). The site still gives each its own key, since a key holds one job at a time."""
     if env.config_file_2.exists():
         return
-    name = (env.machine_name or "worker") + "-2"
+    name = env.machine_name or "worker"
     info = env.enroll(machine_name=name)
     key = info["key"]
     env.work_dir_2.mkdir(parents=True, exist_ok=True)
@@ -812,8 +832,8 @@ def artifact_ok(install, name):
     if name == "ffmpeg":
         return _big_enough([i / "ffmpeg" / "ffmpeg.exe", i / "ffmpeg" / "ffmpeg"], MIN_TOOL_BYTES) or (
             sys.platform != "win32" and shutil.which("ffmpeg") is not None)
-    if name == "enroll":
-        return config_has_key(i / "worker_config.json")
+    if name == "enroll":                         # a text-only key does not finish the full setup: it is replaced
+        return config_has_key(i / "worker_config.json") and not text_key(i)
     return True
 
 
@@ -823,6 +843,19 @@ def verified_done(install, done):
     if "python" in done and "python" not in keep:
         keep -= {"torch", "packages", "check"}
     return keep
+
+
+def text_key(install):
+    """True when this PC's key is a text-upload-only one (enrolled.json "purpose", from the enrol or GET /me)."""
+    try:
+        return json.loads((Path(install) / "enrolled.json").read_text(encoding="utf-8")).get("purpose") == "text"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def key_ready(install):
+    """True when this PC has a worker key, whether from the full setup or the light one."""
+    return config_has_key(Path(install) / "worker_config.json")
 
 
 def is_set_up(install):

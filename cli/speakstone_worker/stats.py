@@ -371,3 +371,48 @@ class GpuMonitor:
 def download_figures(s):
     """(this job MB, today MB) of the worker's OWN downloads (voice sample clips it logged), from a summary."""
     return (s.get("dl_job", 0) / 1e6, s.get("dl_today", 0) / 1e6)
+
+
+# ---- which graphics cards this PC has (any maker), for "can this PC make voice lines?"
+def display_adapters(runner=subprocess.run, platform_name=None):
+    """Names of every graphics adapter the OS reports (NVIDIA, AMD, Intel, ...). Best effort: [] when it cannot tell.
+    nvidia-smi only ever sees NVIDIA cards, so this is how an AMD or Intel card gets a name in the message."""
+    plat = platform_name or sys.platform
+    try:
+        if plat == "win32":
+            r = runner(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }"],
+                       capture_output=True, text=True, timeout=10, creationflags=0x08000000)
+            names = [ln.strip() for ln in (r.stdout or "").splitlines()]
+        else:
+            r = runner(["lspci"], capture_output=True, text=True, timeout=5)
+            names = []
+            for ln in (r.stdout or "").splitlines():
+                low = ln.lower()
+                if "vga compatible" in low or "3d controller" in low or "display controller" in low:
+                    names.append(ln.split(":", 2)[-1].strip())
+    except Exception:
+        return []
+    return [n[:80] for n in names if n][:8]
+
+
+MIN_LINES_MIB = 7900                      # setup.MIN_VRAM_MIB: an "8 GB" card reports 8192 MiB
+
+
+def lines_support(reading, adapters=()):
+    """Can this PC make voice lines? -> (ok, sentence). `reading` is gpu_reading(biggest=True) (None when nvidia-smi
+    found no NVIDIA card); `adapters` is display_adapters(). The voice engine runs on CUDA, so NVIDIA only."""
+    if not reading:
+        others = [a for a in adapters if "nvidia" not in a.lower()]
+        if others:
+            return False, (f"Found {others[0]}. Making voice lines needs an NVIDIA graphics card "
+                           "(8 GB or more), so this part stays off on this PC.")
+        if any("nvidia" in a.lower() for a in adapters):
+            return False, ("Found an NVIDIA card, but its driver did not answer (nvidia-smi). Install the current "
+                           "NVIDIA driver to make voice lines.")
+        return False, "No NVIDIA graphics card was found. Making voice lines needs one with 8 GB or more."
+    mib = int(reading.get("mem_total_mib") or 0)
+    if mib < MIN_LINES_MIB:
+        return False, (f"{reading.get('name') or 'Your graphics card'} has {round(mib / 1024)} GB of memory; making "
+                       "voice lines needs 8 GB or more.")
+    return True, f"{reading.get('name') or 'NVIDIA graphics card'}, {round(mib / 1024)} GB"

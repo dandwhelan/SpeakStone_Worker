@@ -755,12 +755,12 @@ def test_second_worker_gate():
     ok, _ = setup.second_worker_allowed(gpu_rd(16384, 1200))
     assert ok
     assert not setup.second_worker_allowed(gpu_rd(8192))[0]
-    assert not setup.second_worker_allowed(gpu_rd(12288, 4000))[0]          # only 8 GB free
-    assert setup.second_worker_allowed(gpu_rd(12288, 1500))[0]
+    assert not setup.second_worker_allowed(gpu_rd(16384, 7000))[0]          # only 9 GB free
+    assert not setup.second_worker_allowed(gpu_rd(12288, 500))[0]           # 12 GB is not enough since 1.2.26
     assert not setup.second_worker_allowed(None)[0]
 
 
-def test_enroll_second_uses_own_name_key_config_and_work_dir(tmp_path):
+def test_enroll_second_uses_same_name_own_key_config_and_work_dir(tmp_path):
     calls, names = [], []
     env = make_env(tmp_path, calls, [])
     env.install.mkdir(parents=True, exist_ok=True)
@@ -781,11 +781,11 @@ def test_enroll_second_uses_own_name_key_config_and_work_dir(tmp_path):
     env.run = run
     setup.enroll_second(env)
     init = [(c, e) for c, e in calls if "init" in c][0]
-    assert names == ["LAPTOP-2"]
+    assert names == ["LAPTOP"]                                             # same name as worker 1 (1.2.26)
     assert "worker_config_2.json" in " ".join(init[0]) and "work_2" in " ".join(init[0])
     assert init[1]["SSW_WORKER_KEY"] == KEY and KEY not in " ".join(init[0])
     setup.enroll_second(env)                                               # key kept: no second sign-up
-    assert names == ["LAPTOP-2"]
+    assert names == ["LAPTOP"]                                             # same name as worker 1 (1.2.26)
 
 
 def test_set_workers_gate_toggle_and_429_message(tmp_path, monkeypatch):
@@ -793,7 +793,7 @@ def test_set_workers_gate_toggle_and_429_message(tmp_path, monkeypatch):
     monkeypatch.setattr(setup, "artifact_ok", lambda install, name: True)     # the state file alone is not enough now
     st = settings.Settings(tmp_path / "cli.json")
     assert st["workers"] == 1
-    assert "12 GB" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(8192))
+    assert "16 GB" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(8192))
     assert st["workers"] == 1
     # not set up -> asks for setup first
     assert "setup" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(16384, 100))

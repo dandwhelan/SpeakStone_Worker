@@ -641,3 +641,12 @@ def test_stop_file_still_means_stop_now(tmp_path, monkeypatch):
     w, _ = make_worker(tmp_path, monkeypatch)
     (w.work / "STOP").write_text("")
     assert w.stop_requested() and not w.drain_requested()
+
+
+def test_a_text_only_key_stops_the_worker_instead_of_waiting():
+    api = nw.Api("https://x", "k")
+    body = json.dumps({"code": "text_only", "error": "This worker key can only upload text."}).encode()
+    with pytest.raises(nw.ExitRun) as e:
+        api._finish(403, body)
+    assert e.value.code == nw.EXIT_KEY
+    assert api._finish(403, b'{"reason": "paused"}')[0] == 403        # an ordinary 403 (paused) is unchanged

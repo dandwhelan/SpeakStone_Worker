@@ -34,9 +34,41 @@ def _error_code(err):
         return None
 
 
-def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener=open_url, timeout=30):
-    body = json.dumps({"machine_name": machine_name, "gpu": gpu, "vram_mib": int(vram_mib), "os": os_name,
-                       "worker_version": worker_version}).encode("utf-8")
+PURPOSE_TEXT = "text"      # a key only for sending captured WoW text: this PC makes no voice lines (any graphics card)
+PURPOSE_GPU = "gpu"        # an ordinary key: makes voice lines (and sends text). A text key cannot become one: enrol again
+# The site (2026-11-25): a text key may use harvest and /me only; claim, heartbeat, upload-urls, complete and fail
+# answer 403 {"code": "text_only"}.
+
+
+def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener=open_url, timeout=30, purpose=None):
+    """`purpose=PURPOSE_TEXT` asks for a text-upload-only key (the light setup, settings make_lines off). A site that
+    does not know the field yet answers 422: then this asks once more the ordinary way, which works on an 8 GB+
+    NVIDIA PC, so nothing is worse than before."""
+    if purpose:
+        try:
+            info = _enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener, timeout, purpose)
+            info["purpose"] = purpose               # the site's answer does not echo it
+            return info
+        except _Refused422:
+            pass
+    try:
+        info = _enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener, timeout, None)
+        info["purpose"] = PURPOSE_GPU
+        return info
+    except _Refused422 as e:
+        raise EnrollError(e.args[0]) from None
+
+
+class _Refused422(Exception):
+    pass
+
+
+def _enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener, timeout, purpose):
+    fields = {"machine_name": machine_name, "gpu": gpu, "vram_mib": int(vram_mib), "os": os_name,
+              "worker_version": worker_version}
+    if purpose:
+        fields["purpose"] = purpose
+    body = json.dumps(fields).encode("utf-8")
     req = urllib.request.Request(api_base.rstrip("/") + "/api/worker/enroll", data=body, method="POST",
                                  headers={"Content-Type": "application/json",
                                           "User-Agent": f"speakstone-worker-cli/{worker_version}"})
@@ -45,7 +77,10 @@ def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opene
             status = getattr(r, "status", 201)
             data = json.loads(r.read(100_000).decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raise EnrollError(friendly_error(e.code, _error_code(e))) from None
+        code = _error_code(e)
+        if e.code == 422:
+            raise _Refused422(friendly_error(e.code, code)) from None
+        raise EnrollError(friendly_error(e.code, code)) from None
     except (urllib.error.URLError, OSError, TimeoutError):
         raise EnrollError("Could not reach the SpeakStone site. Check your internet connection and try again.") from None
     except ValueError:
