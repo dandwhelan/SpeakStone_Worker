@@ -377,12 +377,16 @@ def decode_reference(data, name="reference"):
     return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
 
 
-def install_memory_loader(tts, store):
-    """Let tts read a MEM_PREFIX name from `store` (name -> samples at REF_SR). Mirrors infer_v2._load_and_cut_audio at
-    830f6f8: librosa.load(path) resamples to librosa's default 22050 Hz, or to `sr` when given, and librosa.resample is
-    the same soxr_hq step load() uses, so the conditioning matches what reading the converted wav gave."""
-    if getattr(tts, "_ss_mem_store", None) is store:
-        return
+def install_memory_loader(tts):
+    """Let tts read a MEM_PREFIX name from its one store (name -> samples at REF_SR), and return that store. Installed
+    once per loaded model: a serve process runs many batches, and wrapping again each time would stack a wrapper per
+    batch for the life of the process. Mirrors infer_v2._load_and_cut_audio at 830f6f8: librosa.load(path) resamples
+    to librosa's default 22050 Hz, or to `sr` when given, and librosa.resample is the same soxr_hq step load() uses, so
+    the conditioning matches what reading the converted wav gave."""
+    store = getattr(tts, "_ss_mem_store", None)
+    if store is not None:
+        return store
+    store = {}
     orig = tts._load_and_cut_audio
 
     def load(audio_path, max_audio_length_seconds, verbose=False, sr=None):
@@ -398,6 +402,7 @@ def install_memory_loader(tts, store):
 
     tts._load_and_cut_audio = load
     tts._ss_mem_store = store
+    return store
 
 
 def seed_all(seed):
@@ -447,7 +452,7 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
         where = "the job's memory" if in_memory else refs
         print(f"[FATAL] Missing {len(missing)} reference files in {where}: {missing[:10]}", file=sys.stderr)
         return 1
-    mem = {}           # this batch's decoded voices, made on first use and dropped when the batch ends
+    mem = {}           # this batch's decoded voices, made on first use and emptied when the batch ends
 
     revision = model_revision()
     prov_path = out / "generation_provenance.jsonl"
@@ -495,7 +500,8 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                 return 1
             tts = load_model(device)
         if in_memory:
-            install_memory_loader(tts, mem)
+            mem = install_memory_loader(tts)
+            mem.clear()
         host = socket.gethostname()
         with open(prov_path, "a", encoding="utf-8") as pf:
             lock = threading.Lock()
@@ -632,6 +638,15 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
             pool.shutdown(wait=True)
             done, failed, held = stats["done"], stats["failed"], held + stats["held"]
     mem.clear()
+    if in_memory and tts is not None:
+        # the engine keeps the last voice's conditioning (and its prompt name) between calls; a network voice must not
+        # stay in a long-lived process after its job
+        for attr in ("cache_spk_cond", "cache_s2mel_style", "cache_s2mel_prompt", "cache_spk_audio_prompt",
+                     "cache_emo_cond", "cache_emo_audio_prompt", "cache_mel"):
+            if hasattr(tts, attr):
+                setattr(tts, attr, None)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     shutil.rmtree(tmp, ignore_errors=True)
     summary = {"batch_file": str(batch.resolve()), "output_dir": str(out.resolve()), "engine": ENGINE,
                "total_items": len(rows), "newly_generated": done, "skipped_valid": skipped, "failed": failed,
@@ -721,6 +736,93 @@ def serve(device="cuda", ref_cache=None, stdin=None, load=None, runner=None):
     return 0
 
 
+# gpt.pth ships as float32 (3.5 GB), and with use_fp16 (always, on a CUDA card) infer_v2 calls gpt.half() straight after
+# loading it, so the model only ever runs on the float16 rounding of those weights. Storing that rounding instead halves
+# the file and makes the same model: load_state_dict widens each float16 value exactly, and .half() narrows it back to
+# the same float16. The other checkpoints (s2mel, w2v-bert, BigVGAN, ...) run in float32 and are left alone.
+# FP16_NOTE (a dot file, so it is outside the model hash's file list) records the float32 file's sha256 and size, which
+# net_worker.compute_model_hash reports in place of the converted file's, so the hash every job is pinned to holds.
+FP16_NOTE = ".fp16.json"
+SHRINK_FILES = ("gpt.pth",)
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def shrink_model(model_dir):
+    """Store SHRINK_FILES as float16, once. -> 0 when converted or nothing to do, 1 on a failure (the float32 file is
+    then untouched). Every converted tensor is read back and compared with the float16 rounding of the original before
+    the original is replaced, and the note is written before the replace, so a stop at any point leaves a model that
+    works and hashes as it should."""
+    d = Path(model_dir).resolve()
+    note_path = d / FP16_NOTE
+    try:
+        note = json.loads(note_path.read_text(encoding="utf-8"))
+        if not isinstance(note, dict):
+            note = {}
+    except (OSError, ValueError):
+        note = {}
+    rc = 0
+    for name in SHRINK_FILES:
+        src = d / name
+        if not src.is_file():
+            continue
+        size = src.stat().st_size
+        if (note.get(name) or {}).get("fp16_size") == size:
+            print(f"[shrink] {name} is already float16", flush=True)
+            continue
+        if shutil.disk_usage(d).free < size * 0.6 + 512 * 1024 ** 2:
+            print(f"[shrink] {name}: not enough free space to convert, left as it is", flush=True)
+            continue
+        part = d / f"{name}.{os.getpid()}.part"
+        try:
+            orig_sha = _sha256(src)
+            try:
+                ck = torch.load(str(src), map_location="cpu", mmap=True)
+            except (RuntimeError, TypeError):
+                ck = torch.load(str(src), map_location="cpu")
+            sd = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+            if not isinstance(sd, dict) or not all(torch.is_tensor(v) for v in sd.values()):
+                print(f"[shrink] {name}: not a plain state dict, left as it is", flush=True)
+                continue
+            # clone: a tensor still backed by the mmap would keep gpt.pth open, and Windows cannot replace an open file
+            half = {k: (v.half() if v.dtype == torch.float32 else v.clone()) for k, v in sd.items()}
+            if not any(v.dtype == torch.float32 for v in sd.values()):
+                print(f"[shrink] {name}: holds no float32 weights, left as it is", flush=True)
+                continue
+            out = dict(ck, model=half) if sd is not ck else half
+            torch.save(out, str(part))
+            del ck, sd, out
+            back = torch.load(str(part), map_location="cpu")
+            back = back["model"] if isinstance(back, dict) and "model" in back else back
+            if back.keys() != half.keys() or not all(back[k].dtype == half[k].dtype and torch.equal(back[k], half[k])
+                                                     for k in half):
+                raise RuntimeError("the float16 file does not read back as written")
+            del back, half
+            import gc
+            gc.collect()
+            note[name] = {"sha256": orig_sha, "size": size, "fp16_sha256": _sha256(part), "fp16_size": part.stat().st_size}
+            tmp = note_path.with_name(note_path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(note, indent=2), encoding="utf-8")
+            os.replace(str(tmp), str(note_path))
+            os.replace(str(part), str(src))
+            print(f"[shrink] {name}: {size / 1e9:.2f} GB -> {note[name]['fp16_size'] / 1e9:.2f} GB", flush=True)
+        except Exception as e:              # noqa: BLE001 - any failure leaves the float32 file in place
+            print(f"[shrink] {name}: not converted: {e}", file=sys.stderr, flush=True)
+            rc = 1
+        finally:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+    return rc
+
+
 def refs_from_json(obj):
     """{clip name: base64} -> {clip name: bytes}. Raises ValueError on any other shape. Names are bare file names."""
     import base64
@@ -761,9 +863,12 @@ def main():
     ap.add_argument("--bitrate", default="32k")
     ap.add_argument("--serve", action="store_true", help="keep the model loaded; read one batch request per stdin line")
     ap.add_argument("--ref-cache", help="serve mode: folder that keeps converted references between batches")
+    ap.add_argument("--shrink-model", metavar="DIR", help="store gpt.pth as float16 (the same model, half the size)")
     ap.add_argument("--refs-stdin", action="store_true",
                     help="read the clips as one JSON line {name: base64} from stdin and keep them in memory")
     a = ap.parse_args()
+    if a.shrink_model:
+        return shrink_model(a.shrink_model)
     if a.serve:
         return serve(a.device, a.ref_cache)
     if not a.batch_file or not a.output_dir:

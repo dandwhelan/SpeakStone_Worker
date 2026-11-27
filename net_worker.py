@@ -79,7 +79,7 @@ VRAM_POLL_SECONDS = 30
 GPU_FATAL_WAIT_SECONDS = 60
 MAX_RESULT_BYTES = 16 * 1024 * 1024   # 4 MB until 1.2.20; a lossless clip is ~8x a 32k one
 MAX_REF_BYTES = 20 * 1024 * 1024
-MAX_REFS_TOTAL_BYTES = 256 * 1024 * 1024   # a job's clips are held in memory; real ones are ~100 KB each
+MAX_REFS_TOTAL_BYTES = 64 * 1024 * 1024    # a job's clips are held in memory (briefly ~3x, as base64 for the engine); real ones are ~100 KB each
 MAX_RESUME = 8
 YIELD_CHECK_SECONDS = 10    # spec 12a, yield
 YIELD_POLL_SECONDS = 20
@@ -319,7 +319,7 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-LOG_KEEP_DAYS = 14
+LOG_KEEP_DAYS = 3       # 14 until 1.2.27: a log names jobs and timings, and older ones help nobody
 
 
 def prune_logs(log_dir, now=None, days=LOG_KEEP_DAYS):
@@ -352,6 +352,73 @@ def wipe_stored_refs(work):
             shutil.rmtree(d, ignore_errors=True)
             removed += 0 if d.exists() else 1
     return removed
+
+
+LEFTOVER_MIN_AGE = 86400     # a cache or half-written file younger than this may belong to a setup still running
+
+
+def _tree_bytes(path):
+    total = 0
+    for cur, _dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.lstat(os.path.join(cur, fn)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def cleanup_after_update(work, install, model_dir, now=None):
+    """What an older version left on the PC that this one no longer wants, removed each start (cheap when there is
+    nothing to do, and the first start after an update is when there is). -> bytes freed. Never raises.
+      - refs/ and ref_wav_cache/ in the work folder: voices kept on disk before 1.2.27
+      - uv_cache/ in the install: wheels only a re-install needs, which an interrupted setup could leave behind
+      - *.part files in the model folder: a model conversion that was stopped part-way"""
+    now = time.time() if now is None else now
+    freed = 0
+    try:
+        for name in STORED_REF_DIRS:
+            d = Path(work) / name
+            if d.is_dir():
+                freed += _tree_bytes(d)
+        wipe_stored_refs(work)
+        uv = Path(install) / "uv_cache"
+        if uv.is_dir() and now - uv.stat().st_mtime > LEFTOVER_MIN_AGE:
+            n = _tree_bytes(uv)
+            shutil.rmtree(uv, ignore_errors=True)
+            freed += 0 if uv.exists() else n
+        for e in os.scandir(model_dir):
+            if e.is_file() and e.name.endswith(".part") and now - e.stat().st_mtime > LEFTOVER_MIN_AGE:
+                n = e.stat().st_size
+                os.unlink(e.path)
+                freed += n
+    except OSError:
+        pass
+    freed += drop_unused_packages(install)
+    return freed
+
+
+UNUSED_PACKAGES = ("triton",)    # the same list as setup.py's: only torch.compile uses it, and the engine never does
+
+
+def drop_unused_packages(install, run=subprocess.run):
+    """Linux installs made before 1.2.27 still carry UNUSED_PACKAGES; uninstall them with the install's own uv.
+    -> bytes freed. Never raises."""
+    if os.name == "nt":
+        return 0
+    install = Path(install)
+    uv, py = install / "tools" / "uv", install / "venv" / "bin" / "python"
+    try:
+        dirs = [d for p in UNUSED_PACKAGES for d in install.glob(f"venv/lib/python*/site-packages/{p}")]
+        if not dirs or not uv.exists() or not py.exists():
+            return 0
+        before = sum(_tree_bytes(d) for d in dirs)
+        run([str(uv), "pip", "uninstall", "--python", str(py), *UNUSED_PACKAGES], capture_output=True, timeout=300,
+            env={**os.environ, "UV_CACHE_DIR": str(install / "uv_cache_tmp")})
+        shutil.rmtree(install / "uv_cache_tmp", ignore_errors=True)
+        return before if not any(d.exists() for d in dirs) else 0
+    except (OSError, subprocess.SubprocessError):
+        return 0
 
 
 def stall_seconds(env=None):
@@ -593,8 +660,24 @@ def list_model_files(model_dir):
     return out
 
 
+FP16_NOTE = ".fp16.json"     # written by indextts2_worker.py --shrink-model; the same name lives there
+
+
+def read_fp16_note(model_dir):
+    """{relpath: {sha256, size, fp16_sha256, fp16_size}} for checkpoints stored as float16, else {}. Never raises."""
+    try:
+        note = json.loads((Path(model_dir) / FP16_NOTE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return note if isinstance(note, dict) else {}
+
+
 def compute_model_hash(model_dir, cache_path=None, hash_file=sha256_file, progress=None):
+    """The model's identity, which every job is pinned to. A checkpoint stored as float16 (indextts2_worker.py
+    --shrink-model) makes the same model as its float32 original, so it is hashed as that original: the note gives the
+    original's sha256 and size, used only when the file on disk is exactly the float16 file the note describes."""
     files = list_model_files(model_dir)
+    note = read_fp16_note(model_dir)
     if cache_path:
         try:
             cached = json.loads(Path(cache_path).read_text(encoding="utf-8"))
@@ -606,7 +689,12 @@ def compute_model_hash(model_dir, cache_path=None, hash_file=sha256_file, progre
     for i, (rel, size, _mt) in enumerate(files):
         if progress:
             progress(i, len(files), rel)
-        lines.append(f"{hash_file(os.path.join(str(model_dir), *rel.split('/')))} {size} {rel}\n")
+        digest = hash_file(os.path.join(str(model_dir), *rel.split('/')))
+        n = note.get(rel)
+        if (isinstance(n, dict) and n.get("fp16_sha256") == digest and n.get("fp16_size") == size
+                and HASH_RE.match(str(n.get("sha256", ""))) and isinstance(n.get("size"), int)):
+            digest, size = n["sha256"], n["size"]
+        lines.append(f"{digest} {size} {rel}\n")
     h = "sha256:" + hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
     if cache_path:
         try:
@@ -1622,15 +1710,21 @@ class Worker:
                 "audio_sec_per_hour": round(self.session_audio / hours, 1)}
         return {k: v for k, v in live.items() if v is not None and k in LIVE_KEYS}
 
+    def anonymous(self):
+        return getattr(self, "tier", None) == "public"
+
     def claim_body(self, resume):
         g = self.gpu_query() or {}
-        # a public-tier key belongs to an anonymous volunteer: their computer's name is not sent
-        name = "worker" if getattr(self, "tier", None) == "public" else self.cfg.machine_name
+        # a public-tier key belongs to an anonymous volunteer: their computer's name, card model and OS build are not
+        # sent, only what scheduling needs (memory, load) and the OS family
+        anon = self.anonymous()
+        name = "worker" if anon else self.cfg.machine_name
         body = {"worker_version": WORKER_VERSION, "engines": [ENGINE], "recipes": [RECIPE],
                 "model_hash": self.model_hash, "model_revision": self.revision[:80],
-                "machine_name": name, "os": os_string(), "resume": resume}
-        for k_body, k_g in (("gpu", "name"), ("vram_total_mib", "vram_total_mib"), ("vram_free_mib", "vram_free_mib"),
-                            ("gpu_util", "gpu_util")):
+                "machine_name": name, "os": os_family() if anon else os_string(), "resume": resume}
+        fields = (("gpu", "name"), ("vram_total_mib", "vram_total_mib"), ("vram_free_mib", "vram_free_mib"),
+                  ("gpu_util", "gpu_util"))
+        for k_body, k_g in fields[1:] if anon else fields:
             if g.get(k_g) is not None:
                 body[k_body] = g[k_g]
         return body
@@ -1672,6 +1766,32 @@ class Worker:
             self.delete_job_dir(jid)
         return ids[:MAX_RESUME]
 
+    SHRINK_TIMEOUT = 1800
+
+    def shrink_model(self, mdir):
+        """Once per install: store gpt.pth as float16 (1.7 GB saved, the same model). Needs torch, so it runs in the
+        engine's Python. A second worker on the same install that starts meanwhile simply finds the file still float32
+        and hashes it as such; the result is the same hash. SSW_SHRINK_MODEL=0 turns it off. Never raises."""
+        if os.environ.get("SSW_SHRINK_MODEL", "1") == "0":
+            return
+        note = read_fp16_note(mdir).get("gpt.pth") or {}
+        try:
+            if not (mdir / "gpt.pth").is_file() or note.get("fp16_size") == (mdir / "gpt.pth").stat().st_size:
+                return
+        except OSError:
+            return
+        script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
+        self.log.event("model", None, state="shrinking")
+        t0 = time.time()
+        try:
+            r = subprocess.run([self.cfg.python, script, "--shrink-model", str(mdir)], env=self.synth_env(),
+                               capture_output=True, text=True, timeout=self.SHRINK_TIMEOUT)
+            ok, why = r.returncode == 0, (r.stderr or r.stdout or "").strip().splitlines()[-1:] or [""]
+        except (OSError, subprocess.SubprocessError) as e:
+            ok, why = False, [describe_exc(e)]
+        self.log.event("model", None, state="shrunk" if ok else "shrink_failed", seconds=round(time.time() - t0, 1),
+                       **({} if ok else {"error": why[0][:160]}))
+
     # ---- startup (8.3 step 1)
     def startup(self):
         mdir = Path(self.cfg.model_dir)
@@ -1681,7 +1801,10 @@ class Worker:
         self.clear_drain()                      # a drain file left from an earlier run must not stop this one
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         prune_logs(self.log.dir)                # housekeeping, only here: before any job is claimed
-        wipe_stored_refs(self.work)
+        freed = cleanup_after_update(self.work, Path(__file__).resolve().parent, mdir)
+        if freed:
+            self.log.event("cleanup", None, freed_mb=round(freed / 1024 ** 2))
+        self.shrink_model(mdir)
         self.log.event("start", None, version=WORKER_VERSION, protocol=PROTOCOL, machine=self.cfg.machine_name,
                        key=mask_key(self.cfg.worker_key), api=self.cfg.api_base)
         self.model_hash = compute_model_hash(mdir, self.work / "model_hash.json")
@@ -1934,6 +2057,7 @@ class Worker:
                                                       True, True))
         finally:
             hb.stop()
+            ctx.refs.clear()                        # the voices go with the job, whatever way it ended
             self._current = None
         if after_wait:
             self.log.event("idle", None, reason="failed_job", wait=after_wait)
@@ -2399,13 +2523,17 @@ class Worker:
                               "qc_why": _s200(rec.get("why")) or "held by worker QC"})
         return {"v": 1, "worker_version": WORKER_VERSION, "model_hash": self.model_hash,
                 "model_revision": self.revision, "torch_version": _s200(torch_v) or "unknown",
-                "gpu": (self.gpu_query() or {}).get("name") or "unknown",
+                "gpu": None if self.anonymous() else ((self.gpu_query() or {}).get("name") or "unknown"),
                 "bitrate": ctx.payload["settings"]["bitrate"], "started_at": ctx.started_at,
                 "finished_at": utc_iso(), "lines": lines}
 
 
 def _s200(v):
     return None if v is None else str(v)[:200]
+
+
+def os_family():
+    return "windows" if platform.system().lower() == "windows" else "linux"
 
 
 def os_string():

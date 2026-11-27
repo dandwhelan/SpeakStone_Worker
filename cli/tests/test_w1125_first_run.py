@@ -283,7 +283,7 @@ def test_text_only_enrol_sends_the_purpose(tmp_path):
         sent.append(json.loads(req.data))
         return _Resp({"key": "sswk_" + "a" * 43, "label": "Calm Heron"})
     enroll.enroll("https://x", "PC", "AMD Radeon", 0, "windows", "1.2.26", opener=opener, purpose=enroll.PURPOSE_TEXT)
-    assert sent == [{"machine_name": "PC", "gpu": "AMD Radeon", "vram_mib": 0, "os": "windows",
+    assert sent == [{"machine_name": "PC", "gpu": "", "vram_mib": 0, "os": "windows",
                      "worker_version": "1.2.26", "purpose": "text"}]
 
 
