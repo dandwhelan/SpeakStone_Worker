@@ -45,7 +45,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.2.26"
+WORKER_VERSION = "1.2.27"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
@@ -79,6 +79,7 @@ VRAM_POLL_SECONDS = 30
 GPU_FATAL_WAIT_SECONDS = 60
 MAX_RESULT_BYTES = 16 * 1024 * 1024   # 4 MB until 1.2.20; a lossless clip is ~8x a 32k one
 MAX_REF_BYTES = 20 * 1024 * 1024
+MAX_REFS_TOTAL_BYTES = 256 * 1024 * 1024   # a job's clips are held in memory; real ones are ~100 KB each
 MAX_RESUME = 8
 YIELD_CHECK_SECONDS = 10    # spec 12a, yield
 YIELD_POLL_SECONDS = 20
@@ -319,9 +320,6 @@ def sha256_file(path):
 
 
 LOG_KEEP_DAYS = 14
-REFS_LIMIT_BYTES = 1024 ** 3        # the downloaded reference clips are a cache; over this size the oldest-used go
-REFS_TARGET_BYTES = 800 * 1024 ** 2
-PART_MAX_AGE = 86400                # a half-finished download older than this is never going to be finished
 
 
 def prune_logs(log_dir, now=None, days=LOG_KEEP_DAYS):
@@ -341,41 +339,18 @@ def prune_logs(log_dir, now=None, days=LOG_KEEP_DAYS):
     return n
 
 
-def prune_refs(refs_dir, now=None, limit=REFS_LIMIT_BYTES, target=REFS_TARGET_BYTES):
-    """Trim the reference-clip cache: remove *.part files older than a day, and when the rest is over `limit` bytes
-    remove the least recently used (newest of access and modify time) until it is under `target`. Called only at
-    start, before any job is claimed, so no job in hand needs a file that goes (a missing one is fetched again anyway).
-    -> how many files were removed. Never raises."""
+STORED_REF_DIRS = ("refs", "ref_wav_cache")   # where clips were kept on disk before 1.2.27
+
+
+def wipe_stored_refs(work):
+    """Delete the reference-clip folders older versions kept in the work folder. Clips now live only in memory for
+    the job that needs them, so a voice is never left on the machine. -> how many folders were removed. Never raises."""
     removed = 0
-    try:
-        now = time.time() if now is None else now
-        files = []
-        for e in os.scandir(refs_dir):
-            try:
-                if not e.is_file():
-                    continue
-                st = e.stat()
-                if e.name.endswith(".part"):
-                    if now - st.st_mtime > PART_MAX_AGE:
-                        os.unlink(e.path)
-                        removed += 1
-                    continue
-                files.append((max(st.st_atime, st.st_mtime), st.st_size, e.path))
-            except OSError:
-                pass
-        total = sum(f[1] for f in files)
-        if total > limit:
-            for _, size, path in sorted(files):
-                if total <= target:
-                    break
-                try:
-                    os.unlink(path)
-                    total -= size
-                    removed += 1
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    for name in STORED_REF_DIRS:
+        d = Path(work) / name
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 0 if d.exists() else 1
     return removed
 
 
@@ -808,14 +783,16 @@ def http_request(method, url, headers=None, data=None, timeout=30, max_bytes=MAX
         raise NetError(describe_exc(e)) from None
 
 
-def download_verified(url, dest_part, expected_bytes, expected_sha, timeout=60):
-    """Stream a presigned GET to dest_part (no Authorization header). -> (bytes, sha256). Raises NetError.
-    Never writes more than expected_bytes + REF_MARGIN_BYTES; a longer stream makes the returned count exceed expected_bytes."""
+def download_verified(url, expected_bytes, expected_sha, timeout=60):
+    """Read a presigned GET into memory (no Authorization header). -> (bytes read, sha256, data). Raises NetError.
+    Never holds more than expected_bytes + REF_MARGIN_BYTES; a longer stream makes the returned count exceed
+    expected_bytes. Nothing is written to disk: a reference is a person's voice and is kept only while a job uses it."""
     check_url(url)
     req = urllib.request.Request(url, method="GET")
     h = hashlib.sha256()
     n = 0
     cap = int(expected_bytes) + REF_MARGIN_BYTES
+    buf = bytearray()
     try:
         with _opener(url).open(req, timeout=timeout) as r:
             try:
@@ -823,24 +800,23 @@ def download_verified(url, dest_part, expected_bytes, expected_sha, timeout=60):
             except (TypeError, ValueError):
                 declared = None
             if declared is not None and declared > cap:
-                return declared, ""                  # refused before reading a byte
-            with open(dest_part, "wb") as f:
-                while True:
-                    chunk = r.read(1 << 16)
-                    if not chunk:
-                        break
-                    n += len(chunk)
-                    if n > cap:                      # longer than declared: stop, the caller reports a mismatch
-                        break
-                    h.update(chunk)
-                    f.write(chunk)
+                return declared, "", b""             # refused before reading a byte
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                n += len(chunk)
+                if n > cap:                          # longer than declared: stop, the caller reports a mismatch
+                    break
+                h.update(chunk)
+                buf += chunk
     except urllib.error.HTTPError as e:
         raise NetError(f"HTTP {e.code}") from None
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
         raise NetError(describe_exc(e)) from None
     except Exception as e:
         raise NetError(describe_exc(e)) from None
-    return n, h.hexdigest()
+    return n, h.hexdigest(), bytes(buf)
 
 
 def _pid_alive(pid):
@@ -1078,6 +1054,8 @@ def check_payload(p):
                     or not isinstance(r.get("text", ""), str)):
                 return "bad_job", "a reference entry is invalid"
             known.add(r["sha256"])
+        if sum(r["bytes"] for r in refs) > MAX_REFS_TOTAL_BYTES:
+            return "bad_job", "the references are too large to hold in memory"
         for n, ln in enumerate(lines):
             if (not isinstance(ln, dict) or ln.get("i") != n or not isinstance(ln.get("text"), str) or not ln["text"]
                     or ln.get("ref") not in known or not isinstance(ln.get("seed"), int)
@@ -1088,6 +1066,9 @@ def check_payload(p):
             why = _post_af_problem(ln.get("post_af", ""))
             if why:
                 return "bad_job", f"line {n} post_af refused: {why}"
+        # Every listed clip is downloaded, so one no line speaks with is a voice this machine has no need to receive.
+        if known - {ln["ref"] for ln in lines}:
+            return "bad_job", "a reference is used by no line"
     except (TypeError, AttributeError):
         return "bad_job", "payload shape is invalid"
     return None
@@ -1164,6 +1145,7 @@ class JobCtx:
         self.worker = None
         self.oom_tries = 0           # engine restarts after "out of memory" in this job (one is allowed)
         self.grace_until = None      # set once every line is made: from then on only a lost lease may abort
+        self.refs = {}               # clip name -> bytes, in memory only, for this job's runs
         self.load_s = 0.0            # engine start to ready, summed over this job's runs (0 when a loaded one was reused)
         self.synth_s = 0.0           # time spent in run_synth, summed over this job's runs
         self.stall_limit = None      # seconds without progress that end a run; None = not watching (set by run_synth)
@@ -1448,7 +1430,6 @@ class Worker:
         set_transfer_policy(cfg.api_base)
         self.work = cfg.work_dir
         self.jobs_dir = self.work / "jobs"
-        self.refs_dir = self.work / "refs"
         self.log = log or Log(self.work / "logs", cfg.worker_key)
         self.api = Api(cfg.api_base, cfg.worker_key, bypass=getattr(cfg, "vercel_bypass", ""))
         self.gpu_query = gpu_query
@@ -1500,7 +1481,7 @@ class Worker:
 
     def serve_command(self):
         script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
-        return [self.cfg.python, script, "--serve", "--ref-cache", os.path.abspath(str(self.work / "ref_wav_cache"))]
+        return [self.cfg.python, script, "--serve"]
 
     def engine_host(self):
         if getattr(self, "engine", None) is None:
@@ -1698,10 +1679,9 @@ class Worker:
             raise ExitRun(EXIT_MODEL, f"model dir missing or incomplete: {mdir}")
         self.work.mkdir(parents=True, exist_ok=True)
         self.clear_drain()                      # a drain file left from an earlier run must not stop this one
-        for d in (self.jobs_dir, self.refs_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
         prune_logs(self.log.dir)                # housekeeping, only here: before any job is claimed
-        prune_refs(self.refs_dir)
+        wipe_stored_refs(self.work)
         self.log.event("start", None, version=WORKER_VERSION, protocol=PROTOCOL, machine=self.cfg.machine_name,
                        key=mask_key(self.cfg.worker_key), api=self.cfg.api_base)
         self.model_hash = compute_model_hash(mdir, self.work / "model_hash.json")
@@ -2150,11 +2130,12 @@ class Worker:
 
     # ---- refs (8.3 step 5)
     def ensure_refs(self, ctx, ref_urls):
-        self.refs_dir.mkdir(parents=True, exist_ok=True)
+        """Fetch the job's clips into ctx.refs, in memory. Each is fetched once per job, when the job starts, and goes
+        with the job: nothing is written to disk and nothing is kept for a later job."""
         for r in ctx.payload["refs"]:
             sha, ext, size = r["sha256"], r["ext"], r["bytes"]
-            dest = self.refs_dir / f"{sha}.{ext}"
-            if dest.is_file() and dest.stat().st_size == size:
+            name = f"{sha}.{ext}"
+            if name in ctx.refs:
                 continue
             entry = ref_urls.get(sha)
             url = entry.get("url") if isinstance(entry, dict) else None
@@ -2164,13 +2145,12 @@ class Worker:
                 check_url(url)
             except NetError as e:
                 raise JobFail("ref_download", str(e)[:200], True, True) from None
-            part = dest.with_name(dest.name + ".part")
             last = ""
             for attempt in range(1, 4):
                 ctx.check()
                 t0 = time.time()
                 try:
-                    n, got = download_verified(url, part, size, sha)
+                    n, got, data = download_verified(url, size, sha)
                 except NetError as e:
                     last = str(e)
                     self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], attempt=attempt, error=last)
@@ -2178,21 +2158,25 @@ class Worker:
                         self.sleep(2 * attempt, ctx)
                     continue
                 if n != size or got != sha:
-                    part.unlink(missing_ok=True)
                     self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], result="mismatch")
                     raise JobFail("ref_mismatch", "reference clip does not match its sha256", True, True)
-                os.replace(str(part), str(dest))
+                ctx.refs[name] = data
                 self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], bytes=n, seconds=round(time.time() - t0, 1))
                 break
             else:
-                part.unlink(missing_ok=True)
                 raise JobFail("ref_download", f"reference download failed: {last}"[:200], True, True)
+
+    @staticmethod
+    def refs_json(ctx):
+        """ctx.refs as the engine reads them: {clip name: base64}."""
+        import base64
+        return {name: base64.b64encode(data).decode("ascii") for name, data in ctx.refs.items()}
 
     # ---- the subprocess (8.3 step 7)
     def synth_command(self, ctx):
         script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
         return [self.cfg.python, script, "--batch-file", str(ctx.dir / "chunk.json"), "--output-dir", str(ctx.out),
-                "--references", str(self.refs_dir), "--bitrate", ctx.payload["settings"]["bitrate"]]
+                "--refs-stdin", "--bitrate", ctx.payload["settings"]["bitrate"]]
 
     def synth_env(self):
         env = dict(os.environ)
@@ -2231,9 +2215,10 @@ class Worker:
             ctx.stall_end()
 
     def engine_request(self, ctx):
-        """One serve-mode request. Absolute paths: the engine runs in the work folder, not in the job's folder."""
+        """One serve-mode request. Absolute paths: the engine runs in the work folder, not in the job's folder. The
+        clips travel inside the request, so they reach the engine through its stdin pipe and never touch the disk."""
         return {"batch_file": os.path.abspath(str(ctx.dir / "chunk.json")), "output_dir": os.path.abspath(str(ctx.out)),
-                "references": os.path.abspath(str(self.refs_dir)), "bitrate": ctx.payload["settings"]["bitrate"]}
+                "refs": self.refs_json(ctx), "bitrate": ctx.payload["settings"]["bitrate"]}
 
     def run_synth_kept(self, ctx):
         ctx.check()
@@ -2252,10 +2237,15 @@ class Worker:
         ctx.check()
         with open(ctx.dir / "worker.log", "ab") as lf:
             proc = subprocess.Popen(self.synth_command(ctx), cwd=str(ctx.dir), env=self.synth_env(),
-                                    stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.PIPE, stdout=lf, stderr=subprocess.STDOUT,
                                     **popen_tree_kwargs())
             ctx.proc = proc
             try:
+                try:                           # the clips go over the pipe, as in the kept engine's requests
+                    proc.stdin.write((json.dumps(self.refs_json(ctx)) + "\n").encode("utf-8"))
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass                       # the engine already exited; its exit code and log say why
                 while True:
                     try:
                         return proc.wait(timeout=0.25)

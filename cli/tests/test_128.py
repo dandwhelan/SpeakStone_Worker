@@ -294,33 +294,20 @@ def test_old_worker_logs_are_deleted_and_recent_and_other_files_stay(tmp_path):
     assert nw.prune_logs(tmp_path / "missing") == 0                      # never raises
 
 
-def test_refs_over_the_limit_lose_the_least_recently_used_first(tmp_path):
-    import os
-    now = time.time()
-    for i, name in enumerate(["a", "b", "c", "d"]):
-        f = tmp_path / f"{name}.ogg"
-        f.write_bytes(b"x" * 100)
-        os.utime(f, (now - 1000 + i * 10, now - 1000 + i * 10))          # a oldest ... d newest
-    os.utime(tmp_path / "a.ogg", (now, now - 5000))                      # a was USED just now: access time wins
-    removed = nw.prune_refs(tmp_path, now=now, limit=350, target=250)
-    assert removed == 2 and sorted(p.name for p in tmp_path.iterdir()) == ["a.ogg", "d.ogg"]
-    assert nw.prune_refs(tmp_path, now=now, limit=350, target=250) == 0   # under the limit: nothing happens
-
-
-def test_refs_under_the_limit_are_untouched_and_old_part_files_go(tmp_path):
-    (tmp_path / "keep.ogg").write_bytes(b"x" * 100)
-    (tmp_path / "old.ogg.part").write_bytes(b"x")
-    (tmp_path / "fresh.ogg.part").write_bytes(b"x")
-    _age(tmp_path / "old.ogg.part", 2)
-    assert nw.prune_refs(tmp_path) == 1
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["fresh.ogg.part", "keep.ogg"]
-    assert nw.REFS_LIMIT_BYTES == 1024 ** 3 and nw.REFS_TARGET_BYTES == 800 * 1024 ** 2
+def test_reference_folders_from_older_versions_are_deleted(tmp_path):
+    for name in ("refs", "ref_wav_cache"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "a.ogg").write_bytes(b"voice")
+    (tmp_path / "jobs").mkdir()
+    assert nw.wipe_stored_refs(tmp_path) == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["jobs"]
+    assert nw.wipe_stored_refs(tmp_path) == 0                            # nothing left: never raises
 
 
 def test_worker_start_prunes_before_any_claim(tmp_path, monkeypatch):
     called = []
     monkeypatch.setattr(nw, "prune_logs", lambda d: called.append(("logs", Path(d).name)))
-    monkeypatch.setattr(nw, "prune_refs", lambda d: called.append(("refs", Path(d).name)))
+    monkeypatch.setattr(nw, "wipe_stored_refs", lambda d: called.append(("refs", Path(d).name)))
     (tmp_path / "model").mkdir()
     (tmp_path / "model" / "config.yaml").write_text("x")
     w, _ = make_worker(tmp_path, monkeypatch)
@@ -329,7 +316,7 @@ def test_worker_start_prunes_before_any_claim(tmp_path, monkeypatch):
     monkeypatch.setattr(nw, "model_revision", lambda *a, **k: "r")
     w.api = type("A", (), {"get_me": staticmethod(lambda: (200, {"worker": {}})), "post": staticmethod(lambda r, b: (200, {}))})()
     w.startup()
-    assert called == [("logs", "logs"), ("refs", "refs")]
+    assert called == [("logs", "logs"), ("refs", "work")]
 
 
 def test_background_log_is_cut_to_its_tail_only_when_large(tmp_path):
@@ -349,7 +336,7 @@ def test_worker_version_matches_the_app_version():
     import re
     from speakstone_worker import __version__
     m = re.search(r'^WORKER_VERSION\s*=\s*"([^"]+)"', (ROOT_DIR / "net_worker.py").read_text(encoding="utf-8"), re.M)
-    assert m and m.group(1) == __version__ == "1.2.26"
+    assert m and m.group(1) == __version__ == "1.2.27"
     assert nw.WORKER_VERSION == __version__
 
 
