@@ -12,7 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import net_worker as nw  # noqa: E402
-from test_net_worker_core import FakeApi, _load_engine_module, make_worker  # noqa: E402
+from test_net_worker_core import FakeApi, _load_engine_module, make_worker, puts  # noqa: E402,F401
 
 
 # ------------------------------------------------------------------ model hash survives the float16 conversion
@@ -155,3 +155,41 @@ def test_the_memory_loader_is_installed_once_per_model(monkeypatch):
         assert m.install_memory_loader(tts) is first
     assert tts._load_and_cut_audio is wrapper                            # never wrapped twice
     assert tts._load_and_cut_audio("plain.wav", 15) == "loaded" and calls == ["plain.wav"]
+
+
+# ------------------------------------------------------------------ clips pinned in RAM and wiped after the job
+def test_a_pinned_clip_is_wiped_and_unpinned():
+    buf = bytearray(b"a voice" * 1000)
+    pinned = nw.pin(buf)
+    assert pinned in (True, False)                                       # best effort: a container may refuse mlock
+    nw.release(buf)
+    assert buf == bytearray(len(buf)) and id(buf) not in nw._PINNED
+    nw.release(bytearray())                                              # never raises, pinned or not
+    nw.release(b"immutable")
+
+
+def test_the_jobs_clips_are_wiped_when_it_ends(tmp_path, monkeypatch, puts):
+    from test_net_worker_core import JOB1, job
+    w, _ = make_worker(tmp_path, monkeypatch, FakeApi([job(JOB1)]))
+    held = []
+    real_pin = nw.pin
+    monkeypatch.setattr(nw, "pin", lambda b: held.append(b) or real_pin(b))
+    try:
+        w.cycle()
+    finally:
+        w.engine_shutdown("test")
+    assert held and all(b == bytearray(len(b)) for b in held)
+
+
+def test_no_core_dumps_sets_the_limit():
+    resource = pytest.importorskip("resource")
+    old = resource.getrlimit(resource.RLIMIT_CORE)
+    try:
+        nw.no_core_dumps()
+        assert resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
+    finally:
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE, (old[0] if old[1] == resource.RLIM_INFINITY or old[0] <= 0 else 0,
+                                                      old[1]))
+        except (ValueError, OSError):
+            pass

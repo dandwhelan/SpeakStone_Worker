@@ -354,6 +354,88 @@ def wipe_stored_refs(work):
     return removed
 
 
+# ----------------------------------------------------------------------------------------------- voices kept off disk
+# A reference clip is a person's voice and lives only in memory for its job (1.2.27). The OS may still write memory to
+# disk: to swap when RAM runs short, or as a core dump when a process crashes. pin() asks it to keep a buffer in RAM
+# (mlock / VirtualLock) and release() wipes and unpins it when the job ends. Python makes passing copies this cannot
+# reach (a base64 string on its way to the engine, ffmpeg's pipe), so this narrows the window rather than closing it;
+# every call is best effort and never raises. The same helpers live in indextts2_worker.py; change both together.
+_PINNED = {}
+
+
+def no_core_dumps():
+    """A crash must not write the process's memory, voices included, to a core file. RLIMIT_CORE, not
+    PR_SET_DUMPABLE: a non-dumpable process hides /proc/<pid>/exe, which the app reads to know its worker is running."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+def _span(buf):
+    import ctypes
+    if isinstance(buf, bytearray):
+        n = len(buf)
+        return (ctypes.addressof((ctypes.c_char * n).from_buffer(buf)) if n else 0), n
+    return int(buf.ctypes.data), int(buf.nbytes)          # a numpy array
+
+
+def pin(buf):
+    """Keep buf (a bytearray or numpy array) out of swap. -> True when the OS agreed."""
+    try:
+        import ctypes
+        addr, n = _span(buf)
+        if not n:
+            return False
+        if os.name == "nt":
+            k = ctypes.windll.kernel32
+            k.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            ok = bool(k.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(n)))
+            if not ok:                                   # the working-set minimum is too small: grow it, try once more
+                lo, hi = ctypes.c_size_t(), ctypes.c_size_t()
+                h = k.GetCurrentProcess()
+                if k.GetProcessWorkingSetSize(h, ctypes.byref(lo), ctypes.byref(hi)):
+                    k.SetProcessWorkingSetSize(h, ctypes.c_size_t(lo.value + n + (1 << 20)),
+                                               ctypes.c_size_t(max(hi.value, lo.value + n + (1 << 21))))
+                    ok = bool(k.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(n)))
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            ok = libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(n)) == 0
+        if ok:
+            _PINNED[id(buf)] = (addr, n)
+        return ok
+    except Exception:                                    # noqa: BLE001 - best effort by design
+        return False
+
+
+def release(buf):
+    """Overwrite buf with zeros and unpin it. Safe on a buffer that was never pinned."""
+    try:
+        if isinstance(buf, bytearray):
+            buf[:] = bytes(len(buf))
+        else:
+            buf.fill(0)
+    except Exception:                                    # noqa: BLE001
+        pass
+    span = _PINNED.pop(id(buf), None)
+    if not span:
+        return
+    try:
+        import ctypes
+        if os.name == "nt":
+            k = ctypes.windll.kernel32
+            k.VirtualUnlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            k.VirtualUnlock(ctypes.c_void_p(span[0]), ctypes.c_size_t(span[1]))
+        else:
+            libc = ctypes.CDLL(None)
+            libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            libc.munlock(ctypes.c_void_p(span[0]), ctypes.c_size_t(span[1]))
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
 LEFTOVER_MIN_AGE = 86400     # a cache or half-written file younger than this may belong to a setup still running
 
 
@@ -872,7 +954,8 @@ def http_request(method, url, headers=None, data=None, timeout=30, max_bytes=MAX
 
 
 def download_verified(url, expected_bytes, expected_sha, timeout=60):
-    """Read a presigned GET into memory (no Authorization header). -> (bytes read, sha256, data). Raises NetError.
+    """Read a presigned GET into memory (no Authorization header). -> (bytes read, sha256, data as a bytearray, so the
+    caller can pin and later wipe it). Raises NetError.
     Never holds more than expected_bytes + REF_MARGIN_BYTES; a longer stream makes the returned count exceed
     expected_bytes. Nothing is written to disk: a reference is a person's voice and is kept only while a job uses it."""
     check_url(url)
@@ -904,7 +987,7 @@ def download_verified(url, expected_bytes, expected_sha, timeout=60):
         raise NetError(describe_exc(e)) from None
     except Exception as e:
         raise NetError(describe_exc(e)) from None
-    return n, h.hexdigest(), bytes(buf)
+    return n, h.hexdigest(), buf
 
 
 def _pid_alive(pid):
@@ -2057,7 +2140,9 @@ class Worker:
                                                       True, True))
         finally:
             hb.stop()
-            ctx.refs.clear()                        # the voices go with the job, whatever way it ended
+            for data in ctx.refs.values():          # the voices go with the job, whatever way it ended
+                release(data)
+            ctx.refs.clear()
             self._current = None
         if after_wait:
             self.log.event("idle", None, reason="failed_job", wait=after_wait)
@@ -2282,8 +2367,10 @@ class Worker:
                         self.sleep(2 * attempt, ctx)
                     continue
                 if n != size or got != sha:
+                    release(data)
                     self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], result="mismatch")
                     raise JobFail("ref_mismatch", "reference clip does not match its sha256", True, True)
+                pin(data)
                 ctx.refs[name] = data
                 self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], bytes=n, seconds=round(time.time() - t0, 1))
                 break
@@ -2620,6 +2707,7 @@ def trust_bundled_certificates(ssl_module=None, where=None):
 
 def main(argv=None, env=None):
     no_error_boxes()
+    no_core_dumps()
     trust_bundled_certificates()
     args = build_parser().parse_args(argv)
     if args.command == "init":

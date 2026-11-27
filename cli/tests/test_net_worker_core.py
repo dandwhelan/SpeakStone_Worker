@@ -164,7 +164,7 @@ def make_worker(tmp_path, monkeypatch, api=None, mode="", keep=True, gpu=None):
 
     def fake_download(url, size, sha, timeout=60):
         fetched.append(url)
-        return len(REF), REF_SHA, REF
+        return len(REF), REF_SHA, bytearray(REF)
     monkeypatch.setattr(nw, "download_verified", fake_download)
     w.fetched = fetched
     return w, state
