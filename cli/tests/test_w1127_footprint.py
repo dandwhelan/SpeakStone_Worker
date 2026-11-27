@@ -193,3 +193,70 @@ def test_no_core_dumps_sets_the_limit():
                                                       old[1]))
         except (ValueError, OSError):
             pass
+
+
+# ------------------------------------------------------------------ clips encrypted at rest in R2 (site: lib/refcrypt.ts)
+VECTOR = "a1c08c0a93c03747d6147066483f0f6d7921420a2e09f3b017cbd5d91921e3178efdee4371"   # the site's test has the same
+
+
+def test_decrypt_matches_the_sites_cipher():
+    b = bytearray(b"SpeakStone reference clip test vector")
+    nw.decrypt_ref(b, bytes([7]) * 32)
+    assert b.hex() == VECTOR
+    nw.decrypt_ref(b, bytes([7]) * 32)                                   # the same XOR both ways
+    assert b == bytearray(b"SpeakStone reference clip test vector")
+    with pytest.raises(ValueError):
+        nw.decrypt_ref(bytearray(b"x"), b"short")
+
+
+def test_an_encrypted_clip_is_decrypted_in_memory_and_checked(tmp_path, monkeypatch, puts):
+    import base64
+    import hashlib
+    from test_net_worker_core import JOB1, REF, REF_SHA, job
+    key = bytes(range(32))
+    cipher = bytearray(REF)
+    nw.decrypt_ref(cipher, key)                                          # what the uploader stored
+    j = job(JOB1)
+    j["ref_urls"][REF_SHA]["key"] = base64.b64encode(key).decode()
+    w, state = make_worker(tmp_path, monkeypatch, FakeApi([j]))
+    monkeypatch.setattr(nw, "download_verified",
+                        lambda url, size, sha, timeout=60: (len(cipher), hashlib.sha256(cipher).hexdigest(),
+                                                            bytearray(cipher)))
+    try:
+        w.cycle()
+    finally:
+        w.engine_shutdown("test")
+    assert "complete" in w.api.routes()
+    reqs = [json.loads(x) for x in (state / "reqs.txt").read_text().splitlines()]
+    assert reqs[0]["refs"] == {f"{REF_SHA}.ogg": base64.b64encode(REF).decode()}   # the engine got the plain clip
+
+
+def test_a_wrong_key_fails_the_checksum_not_the_engine(tmp_path, monkeypatch, puts):
+    import base64
+    import hashlib
+    from test_net_worker_core import JOB1, REF, REF_SHA, job
+    j = job(JOB1)
+    j["ref_urls"][REF_SHA]["key"] = base64.b64encode(b"\x01" * 32).decode()
+    w, state = make_worker(tmp_path, monkeypatch, FakeApi([j]))
+    monkeypatch.setattr(nw, "download_verified",
+                        lambda url, size, sha, timeout=60: (len(REF), hashlib.sha256(REF).hexdigest(), bytearray(REF)))
+    try:
+        w.cycle()
+    finally:
+        w.engine_shutdown("test")
+    assert "complete" not in w.api.routes() and not (state / "reqs.txt").exists()
+    fails = [b for r, b in w.api.calls if r == "fail"]
+    assert fails and fails[0]["reason"] == "ref_mismatch"
+
+
+def test_a_malformed_key_refuses_the_job(tmp_path, monkeypatch, puts):
+    from test_net_worker_core import JOB1, REF_SHA, job
+    j = job(JOB1)
+    j["ref_urls"][REF_SHA]["key"] = "not base64!"
+    w, _ = make_worker(tmp_path, monkeypatch, FakeApi([j]))
+    try:
+        w.cycle()
+    finally:
+        w.engine_shutdown("test")
+    fails = [b for r, b in w.api.calls if r == "fail"]
+    assert fails and fails[0]["reason"] == "bad_job"

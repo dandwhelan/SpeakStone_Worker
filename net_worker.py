@@ -436,6 +436,23 @@ def release(buf):
         pass
 
 
+REF_KEY_DOMAIN = b"speakstone ref v1\0"
+
+
+def decrypt_ref(data, key):
+    """A clip stored encrypted in R2 (the site's lib/refcrypt.ts; change both): data XOR SHAKE256(domain || key)
+    truncated to its length. Decrypts `data` (a bytearray) in place, so the plain clip lands in the buffer that is
+    already pinned and is wiped with the job. The integer XOR runs in C; its temporary copies are released at once."""
+    if len(key) != 32:
+        raise ValueError("a reference key is 32 bytes")
+    n = len(data)
+    if not n:
+        return data
+    stream = hashlib.shake_256(REF_KEY_DOMAIN + bytes(key)).digest(n)
+    data[:] = (int.from_bytes(data, "big") ^ int.from_bytes(stream, "big")).to_bytes(n, "big")
+    return data
+
+
 LEFTOVER_MIN_AGE = 86400     # a cache or half-written file younger than this may belong to a setup still running
 
 
@@ -2350,6 +2367,15 @@ class Worker:
             url = entry.get("url") if isinstance(entry, dict) else None
             if not url:
                 raise JobFail("ref_download", "no download URL for a reference", True, True)
+            secret = None
+            if isinstance(entry, dict) and entry.get("key") is not None:
+                try:
+                    import base64
+                    secret = base64.b64decode(str(entry["key"]), validate=True)
+                except ValueError:
+                    secret = b""
+                if len(secret) != 32:
+                    raise JobFail("bad_job", "a reference key is invalid", False, True)
             try:
                 check_url(url)
             except NetError as e:
@@ -2360,6 +2386,10 @@ class Worker:
                 t0 = time.time()
                 try:
                     n, got, data = download_verified(url, size, sha)
+                    if secret is not None and n == size:     # encrypted at rest: the sha names the plain clip
+                        pin(data)
+                        decrypt_ref(data, secret)
+                        got = hashlib.sha256(data).hexdigest()
                 except NetError as e:
                     last = str(e)
                     self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], attempt=attempt, error=last)
@@ -2370,7 +2400,8 @@ class Worker:
                     release(data)
                     self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], result="mismatch")
                     raise JobFail("ref_mismatch", "reference clip does not match its sha256", True, True)
-                pin(data)
+                if secret is None:
+                    pin(data)
                 ctx.refs[name] = data
                 self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], bytes=n, seconds=round(time.time() - t0, 1))
                 break
