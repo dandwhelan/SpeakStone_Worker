@@ -16,6 +16,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Publish a release with this tag (e.g. v1.2.27), created on the commit being built. Empty: build only."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -61,8 +66,9 @@ jobs:
           if-no-files-found: error
 
   release:
-    # only for a tag, and only when BOTH builds succeeded
-    if: startsWith(github.ref, 'refs/tags/v')
+    # only for a tag (pushed, or named when the build is started by hand), and only when BOTH builds succeeded.
+    # Starting it by hand with a tag is for when a tag cannot be pushed from where the release is made.
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.tag, 'v')
     needs: app
     runs-on: ubuntu-22.04
     permissions:
@@ -81,10 +87,22 @@ jobs:
             test -s "$f.sha256" || { echo "missing $f.sha256"; exit 1; }
             sha256sum -c "$f.sha256"
           done
+      - name: The tag names the version that was built
+        if: inputs.tag != ''
+        run: |
+          want="${INPUT_TAG#v}"; want="${want%%-*}"
+          sudo chmod +x out/SpeakStoneWorker-linux
+          got="$(out/SpeakStoneWorker-linux --version)"
+          echo "built: $got  tag: $INPUT_TAG"
+          case "$got" in *"$want"*) ;; *) echo "the build is not version $want"; exit 1 ;; esac
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           fail_on_unmatched_files: true
           files: |
             out/SpeakStoneWorker-windows.exe
