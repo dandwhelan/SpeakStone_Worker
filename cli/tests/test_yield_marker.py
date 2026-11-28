@@ -59,3 +59,43 @@ def test_start_time_of_this_process_is_read(tmp_path):
     if sys.platform.startswith("linux") or os.name == "nt":
         assert started is not None and started <= time.time() + 1 and time.time() - started < 7 * 86400
     assert nw._pid_started(999999999) is None
+
+
+def test_a_job_waits_for_the_lock_to_stay_free(tmp_path, monkeypatch):
+    """A watcher drops and retakes its lock in bursts: no job starts until the lock has been free for a while."""
+    nw = load_worker()
+    from test_net_worker_core import make_worker
+    w, _ = make_worker(tmp_path, monkeypatch)
+    w.cfg.need_free_mib = 0
+    lock = tmp_path / "watcher.lock"
+    w.cfg.yield_lock = str(lock)
+    t = {"now": 1000.0}
+    w.clock = lambda: t["now"]
+    slept = []
+
+    def sleep(s, ctx=None):
+        slept.append(s)
+        t["now"] += s
+        if t["now"] >= 1040:                      # the burst ends 40 s in
+            lock.unlink(missing_ok=True)
+    w.sleep_impl = sleep
+    monkeypatch.setattr(nw, "_pid_started", lambda pid: None)
+    lock.write_text(str(os.getppid()), encoding="utf-8")
+    w.wait_for_vram()
+    # last seen held at the check before the burst ended (1020): the settle time runs from there
+    assert t["now"] >= 1020 + nw.LOCK_SETTLE_SECONDS
+    assert t["now"] < 1040 + nw.LOCK_SETTLE_SECONDS + nw.YIELD_POLL_SECONDS
+    events = [ln for f in (tmp_path / "logs").glob("worker_*.log") for ln in f.read_text().splitlines()]
+    assert any("reason=yield" in e and "settle=" in e for e in events)
+
+
+def test_a_lock_never_seen_held_costs_no_wait(tmp_path, monkeypatch):
+    nw = load_worker()
+    from test_net_worker_core import make_worker
+    w, _ = make_worker(tmp_path, monkeypatch)
+    w.cfg.need_free_mib = 0
+    w.cfg.yield_lock = str(tmp_path / "absent.lock")
+    slept = []
+    w.sleep_impl = lambda s, ctx=None: slept.append(s)
+    w.wait_for_vram()
+    assert slept == [] and w.lock_settle_left() == 0
