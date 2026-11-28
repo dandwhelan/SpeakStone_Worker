@@ -45,7 +45,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.2.27"
+WORKER_VERSION = "1.2.28"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
@@ -83,6 +83,10 @@ MAX_REFS_TOTAL_BYTES = 64 * 1024 * 1024    # a job's clips are held in memory (b
 MAX_RESUME = 8
 YIELD_CHECK_SECONDS = 10    # spec 12a, yield
 YIELD_POLL_SECONDS = 20
+# Once another program's GPU lock has been seen held, a job starts only after the lock has stayed free this long.
+# A watcher cycle takes and drops its lock in short bursts, and every job started in a gap lost its work and a model
+# load at the next burst (four restarts of one job in 17 minutes, 2026-11-28). Mid-job, a lock still stops at once.
+LOCK_SETTLE_SECONDS = 120
 PRESENCE_SECONDS = 240      # while stepping aside (yield / vram) no call reaches the site: say "still here" this often
 PING_FAIL_LOG_SECONDS = 1800   # a failing presence call is logged at most this often
 MAX_RERUNS = 2            # reruns of indextts2_worker.py after the first run
@@ -1745,7 +1749,21 @@ class Worker:
         if not force and now - self._yield_at < YIELD_CHECK_SECONDS:
             return self._yield_last
         self._yield_at, self._yield_last = now, lock_held(path)
+        if self._yield_last:
+            self._lock_held_at = getattr(self, "clock", time.monotonic)()
         return self._yield_last
+
+    def lock_settle_left(self):
+        """Seconds still to wait for the GPU lock to have stayed free LOCK_SETTLE_SECONDS since it was last seen held
+        (0 when it has, or was never seen held). SSW_LOCK_SETTLE_SECONDS overrides the length."""
+        held_at = getattr(self, "_lock_held_at", None)
+        if held_at is None:
+            return 0.0
+        try:
+            settle = max(0.0, float(os.environ.get("SSW_LOCK_SETTLE_SECONDS", LOCK_SETTLE_SECONDS)))
+        except ValueError:
+            settle = LOCK_SETTLE_SECONDS
+        return max(0.0, settle - (getattr(self, "clock", time.monotonic)() - held_at))
 
     def stop_requested(self):
         if self.stop_event.is_set():
@@ -1993,11 +2011,20 @@ class Worker:
             self._ping_at = None
 
     def _wait_for_vram(self):
-        while self.yield_busy(force=True):
-            self.engine_shutdown("yield")          # local GPU work gets the engine's memory back
-            self.log.event("idle", None, reason="yield", wait=YIELD_POLL_SECONDS)
+        while True:
+            if self.yield_busy(force=True):
+                self.engine_shutdown("yield")      # local GPU work gets the engine's memory back
+                self.log.event("idle", None, reason="yield", wait=YIELD_POLL_SECONDS)
+                self.presence()
+                self.sleep(YIELD_POLL_SECONDS)
+                continue
+            left = self.lock_settle_left() if hasattr(self, "lock_settle_left") else 0
+            if left <= 0:
+                break
+            wait = min(YIELD_POLL_SECONDS, left)   # the lock is free, but only just: let a burst of work finish
+            self.log.event("idle", None, reason="yield", settle=round(left), wait=round(wait, 1))
             self.presence()
-            self.sleep(YIELD_POLL_SECONDS)
+            self.sleep(wait)
         need = self.cfg.need_free_mib
         if need <= 0 or self.skip_vram_wait:
             return
