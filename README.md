@@ -55,13 +55,13 @@ closer to the game. Every helper makes that happen sooner.
    and run it. There is nothing to install by hand.
 2. The first start asks which of the three jobs you want (add-on updates, sending WoW text, lending your graphics
    card). Lending the card is only offered with an NVIDIA card of 8 GB or more; on a 16 GB card it suggests running
-   two workers, which share one name on the network page. Then it sets up what you chose by itself: it downloads the voice engine and its files (about 20 GB of disk
+   two workers, which share one name on the network page. Then it sets up what you chose by itself: it downloads the voice engine and its files (about 18 GB of disk
    in all) and joins the queue. No account and no sign-up.
 3. That's it. It runs quietly in the background from then on, and the window shows what it is doing whenever you
    open it.
 
 **You need:** Windows 10/11 or Linux, an NVIDIA graphics card with at least 8 GB of memory, and about 20 GB free on
-disk. The add-on updates and the text sending work on any PC that has WoW installed.
+disk while it sets up (about 18 GB stays used). The add-on updates and the text sending work on any PC that has WoW installed.
 
 Windows may show a "Windows protected your PC" notice the first time, because the app is not code-signed yet. See
 [Is it safe?](#is-it-safe) for how to check the download is the real one before you run it.
@@ -112,9 +112,19 @@ Get-FileHash .\SpeakStoneWorker-windows.exe -Algorithm SHA256
 - The quest, gossip and book text the add-on noted, to the SpeakStone website. With it go the game's language and
   version, the add-on version, and the class, race, sex and faction of the character that read it (never a
   character or account name).
-- The voice lines it made, and basic facts about the PC so the queue can hand out the right work: the PC's name,
-  the graphics card's name and memory, and the Worker's version. Helpers appear on the
+- The voice lines it made, and only what the queue needs to hand out the right work: how much memory the graphics
+  card has and how busy it is, whether the PC runs Windows or Linux, and the Worker's version. Not your PC's name,
+  not the graphics card's model, not your Windows build. Helpers appear on the
   [network page](https://speakstone.beanw.co.uk/network) under a made-up label you can rename.
+
+**The voices it works with stay private**
+- Each job comes with a few short voice samples to speak with. Some may be recordings people donated of their own
+  voice. The Worker downloads them through links that only work for ten minutes and only for that job, keeps them in
+  memory (never on disk), asks the system to keep them out of the swap file, and wipes them as soon as the job ends.
+- It never keeps a voice for later, and it never sends one anywhere. A crash does not write its memory to disk.
+- When someone withdraws their donated voice, every unfinished job using it is cancelled and its copies are deleted
+  from the server.
+- Its own log files are kept for three days, and hold counts and timings only: never the text of a line.
 
 **What it never does**
 - It never edits WoW's own files or your saved games. It writes only to SpeakStone's add-on folders, its own
@@ -132,7 +142,7 @@ Get-FileHash .\SpeakStoneWorker-windows.exe -Algorithm SHA256
 - The [network page](https://speakstone.beanw.co.uk/network) shows live how many lines the helpers are making.
 - The upload log (`[L]` in Settings) links each upload to its page on the website, showing which lines arrived and
   which have been voiced since.
-- More than 550 automated tests check the Worker's behaviour on every change, including the safety rules above.
+- More than 600 automated tests check the Worker's behaviour on every change, including the safety rules above.
 
 **Getting rid of it** takes one key: Settings `[6]` stops it, removes the background task and deletes every file it
 downloaded.
@@ -228,7 +238,7 @@ docker build -f docker/Dockerfile -t speakstone-worker .
 docker run --gpus all -e SSW_WORKER_KEY=sswk_... speakstone-worker
 ```
 
-- `--build-arg BAKE_MODELS=0` builds a slim image without the model files (about 8 GB smaller). It fetches them
+- `--build-arg BAKE_MODELS=0` builds a slim image without the model files (about 6 GB smaller). It fetches them
   once into `/data` (or `/workspace/speakstone`); mount a disk that outlives the machine there and later machines
   start without downloading.
 - Optional settings: `SSW_MACHINE_NAME`, `SSW_DATA` (where work files and fetched model files go).
@@ -243,13 +253,23 @@ python net_worker.py --print-model-hash
 Prints the fingerprint of your IndexTTS-2 folder. The site only gives jobs to workers whose model matches the
 one it expects.
 
+A model stored with `gpt.pth` as float16 (`indextts2_worker.py --shrink-model`, which the worker runs once at start)
+hashes the same as the float32 original: `.fp16.json` in the model folder records the original's sha256, and is
+used only when the file on disk is exactly the converted one. The engine halves the GPT on load anyway, so the
+weights it runs on are bit-identical. `SSW_SHRINK_MODEL=0` turns the conversion off.
+
 ### What the engine sends and receives
 
-- Receives: a job (lines of text, small voice sample clips, settings) from the site.
-- Sends: the finished audio clips, a result list, and basic machine facts (machine name, GPU name and free memory,
-  worker version).
+- Receives: a job (lines of text, small voice sample clips, settings) from the site. Clips are fetched into memory
+  (pinned against swap where the OS allows) and reach the engine through its stdin pipe; nothing about a clip is
+  written to disk, and the buffers are wiped when the job ends. Core dumps are off for both processes.
+- Sends: the finished audio clips, a result list, and machine facts for scheduling (GPU memory and load, worker
+  version). A public key sends only the OS family and no machine name or GPU model; own and rented keys also send
+  those, for the owner's list.
 - Privacy: the worker key is never logged or printed (only `sswk_` plus the last four characters). The text of a
-  line is never logged. Nothing else on your machine is read or uploaded.
+  line is never logged. Logs are kept three days. Nothing else on your machine is read or uploaded.
+- Each start removes what older versions left: the `refs/` and `ref_wav_cache/` folders (clips kept on disk before
+  1.2.27), a leftover `uv_cache/`, half-written model files, and triton on Linux.
 
 Exit codes: 0 stopped, 2 config error, 3 key refused, 4 protocol refused, 5 model folder missing, 6 another worker is
 already running with this key (config file) on this PC.

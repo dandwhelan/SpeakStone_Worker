@@ -359,6 +359,137 @@ def prepare_reference(refs_dir, ref_clip, cache_dir):
     return out
 
 
+# Network jobs hand the engine its voice samples as bytes, never as files: a donor's voice is not left on a volunteer's
+# disk. The clip is decoded through ffmpeg's pipes to the same 16-bit 24 kHz mono a converted wav holds, and the engine
+# reads it through MEM_PREFIX names that install_memory_loader() resolves, so a take is made from the same samples
+# either way.
+MEM_PREFIX = "mem:"
+REF_SR = 24000
+
+
+def decode_reference(data, name="reference"):
+    """Clip bytes (Ogg or wav) -> float32 mono samples at REF_SR, the values soundfile reads from a pcm_s16le wav."""
+    r = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-ac", "1", "-ar", str(REF_SR),
+                        "-t", str(REF_MAX_SECONDS), "-f", "s16le", "pipe:1"], input=data, capture_output=True, timeout=60)
+    if r.returncode != 0 or not r.stdout:
+        raise RuntimeError(f"reference convert failed for {name}: {r.stderr.decode('utf-8', 'replace')[-300:]}")
+    pcm = r.stdout[:len(r.stdout) - len(r.stdout) % 2]
+    out = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+    out /= 32768.0                                       # in place: the same values, one array to pin and wipe
+    pin(out)
+    return out
+
+
+def install_memory_loader(tts):
+    """Let tts read a MEM_PREFIX name from its one store (name -> samples at REF_SR), and return that store. Installed
+    once per loaded model: a serve process runs many batches, and wrapping again each time would stack a wrapper per
+    batch for the life of the process. Mirrors infer_v2._load_and_cut_audio at 830f6f8: librosa.load(path) resamples
+    to librosa's default 22050 Hz, or to `sr` when given, and librosa.resample is the same soxr_hq step load() uses, so
+    the conditioning matches what reading the converted wav gave."""
+    store = getattr(tts, "_ss_mem_store", None)
+    if store is not None:
+        return store
+    store = {}
+    orig = tts._load_and_cut_audio
+
+    def load(audio_path, max_audio_length_seconds, verbose=False, sr=None):
+        if not (isinstance(audio_path, str) and audio_path.startswith(MEM_PREFIX)):
+            return orig(audio_path, max_audio_length_seconds, verbose, sr)
+        import librosa
+        target = sr or 22050
+        audio = librosa.resample(store[audio_path], orig_sr=REF_SR, target_sr=target) if target != REF_SR \
+            else store[audio_path]
+        audio = torch.tensor(np.ascontiguousarray(audio, dtype=np.float32)).unsqueeze(0)
+        cap = int(max_audio_length_seconds * target)
+        return (audio[:, :cap] if audio.shape[1] > cap else audio), target
+
+    tts._load_and_cut_audio = load
+    tts._ss_mem_store = store
+    return store
+
+
+# ----------------------------------------------------------------------------------------------- voices kept off disk
+# A reference clip is a person's voice and lives only in memory for its job (1.2.27). The OS may still write memory to
+# disk: to swap when RAM runs short, or as a core dump when a process crashes. pin() asks it to keep a buffer in RAM
+# (mlock / VirtualLock) and release() wipes and unpins it when the job ends. Python makes passing copies this cannot
+# reach (a base64 string on its way to the engine, ffmpeg's pipe), so this narrows the window rather than closing it;
+# every call is best effort and never raises. The same helpers live in net_worker.py; change both together.
+_PINNED = {}
+
+
+def no_core_dumps():
+    """A crash must not write the process's memory, voices included, to a core file. RLIMIT_CORE, not
+    PR_SET_DUMPABLE: a non-dumpable process hides /proc/<pid>/exe, which the app reads to know its worker is running."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+def _span(buf):
+    import ctypes
+    if isinstance(buf, bytearray):
+        n = len(buf)
+        return (ctypes.addressof((ctypes.c_char * n).from_buffer(buf)) if n else 0), n
+    return int(buf.ctypes.data), int(buf.nbytes)          # a numpy array
+
+
+def pin(buf):
+    """Keep buf (a bytearray or numpy array) out of swap. -> True when the OS agreed."""
+    try:
+        import ctypes
+        addr, n = _span(buf)
+        if not n:
+            return False
+        if os.name == "nt":
+            k = ctypes.windll.kernel32
+            k.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            ok = bool(k.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(n)))
+            if not ok:                                   # the working-set minimum is too small: grow it, try once more
+                lo, hi = ctypes.c_size_t(), ctypes.c_size_t()
+                h = k.GetCurrentProcess()
+                if k.GetProcessWorkingSetSize(h, ctypes.byref(lo), ctypes.byref(hi)):
+                    k.SetProcessWorkingSetSize(h, ctypes.c_size_t(lo.value + n + (1 << 20)),
+                                               ctypes.c_size_t(max(hi.value, lo.value + n + (1 << 21))))
+                    ok = bool(k.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(n)))
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            ok = libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(n)) == 0
+        if ok:
+            _PINNED[id(buf)] = (addr, n)
+        return ok
+    except Exception:                                    # noqa: BLE001 - best effort by design
+        return False
+
+
+def release(buf):
+    """Overwrite buf with zeros and unpin it. Safe on a buffer that was never pinned."""
+    try:
+        if isinstance(buf, bytearray):
+            buf[:] = bytes(len(buf))
+        else:
+            buf.fill(0)
+    except Exception:                                    # noqa: BLE001
+        pass
+    span = _PINNED.pop(id(buf), None)
+    if not span:
+        return
+    try:
+        import ctypes
+        if os.name == "nt":
+            k = ctypes.windll.kernel32
+            k.VirtualUnlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            k.VirtualUnlock(ctypes.c_void_p(span[0]), ctypes.c_size_t(span[1]))
+        else:
+            libc = ctypes.CDLL(None)
+            libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            libc.munlock(ctypes.c_void_p(span[0]), ctypes.c_size_t(span[1]))
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
 def seed_all(seed):
     """Every RNG the engine may draw from, set right before a line (or a piece of a split line) is made."""
     random.seed(seed)
@@ -380,12 +511,14 @@ def by_voice(pending):
 
 def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cuda", ref_cache=None):
     """Make one batch file. -> exit code (0 all made or held, 1 a failure). `tts` is a loaded model, or None to load
-    one only if a line needs making (the one-shot command). `ref_cache` is a folder that keeps converted references
+    one only if a line needs making (the one-shot command). `references` is a folder of clips, or a dict of clip name
+    -> bytes held in memory (network jobs), in which case nothing about a reference is written to disk. `ref_cache` is a folder that keeps converted references
     between batches (serve mode); None keeps them in the batch's own temporary folder, as the one-shot command always
     did. Paths are made absolute first: in serve mode the process does not run in the job's folder."""
     batch = Path(batch_file).resolve()
     out = Path(output_dir).resolve()
-    refs = Path(references).resolve()
+    in_memory = isinstance(references, dict)
+    refs = None if in_memory else Path(references).resolve()
     out.mkdir(parents=True, exist_ok=True)
     tmp = out / ".tmp_indextts2"
     tmp.mkdir(exist_ok=True)
@@ -395,10 +528,16 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
     if not rows:
         return 0
 
-    missing = sorted({r["canonical_reference_clip"] for r in rows if not (refs / r["canonical_reference_clip"]).exists()})
+    if in_memory:
+        missing = sorted({r["canonical_reference_clip"] for r in rows if r["canonical_reference_clip"] not in references})
+    else:
+        missing = sorted({r["canonical_reference_clip"] for r in rows
+                          if not (refs / r["canonical_reference_clip"]).exists()})
     if missing:
-        print(f"[FATAL] Missing {len(missing)} reference files in {refs}: {missing[:10]}", file=sys.stderr)
+        where = "the job's memory" if in_memory else refs
+        print(f"[FATAL] Missing {len(missing)} reference files in {where}: {missing[:10]}", file=sys.stderr)
         return 1
+    mem = {}           # this batch's decoded voices, made on first use and emptied when the batch ends
 
     revision = model_revision()
     prov_path = out / "generation_provenance.jsonl"
@@ -445,6 +584,9 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                 print("[FATAL] CUDA requested but not available.", file=sys.stderr)
                 return 1
             tts = load_model(device)
+        if in_memory:
+            mem = install_memory_loader(tts)
+            mem.clear()
         host = socket.gethostname()
         with open(prov_path, "a", encoding="utf-8") as pf:
             lock = threading.Lock()
@@ -533,8 +675,13 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                 t0 = time.time()
                 try:
                     seed_all(seed)
-                    ref = prepare_reference(refs, row["canonical_reference_clip"],
-                                            Path(ref_cache) if ref_cache is not None else tmp / "refs")
+                    clip = row["canonical_reference_clip"]
+                    if in_memory:
+                        ref = MEM_PREFIX + clip
+                        if ref not in mem:
+                            mem[ref] = decode_reference(references[clip], clip)
+                    else:
+                        ref = prepare_reference(refs, clip, Path(ref_cache) if ref_cache is not None else tmp / "refs")
                     # 2026-11-07: beams by emotion (beams_for); infer_v2 defaults to 3
                     kw = dict(spk_audio_prompt=str(ref), output_path=None, verbose=False, num_beams=beams)
                     if row.get("temperature") is not None:
@@ -575,6 +722,21 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                     print(f"[{ENGINE}] Progress: {i}/{len(pending)} | Done: {stats['done']} | Rate: {rate:.1f} clips/hr", flush=True)
             pool.shutdown(wait=True)
             done, failed, held = stats["done"], stats["failed"], held + stats["held"]
+    for arr in mem.values():
+        release(arr)
+    mem.clear()
+    if in_memory:
+        for data in references.values():
+            release(data)
+    if in_memory and tts is not None:
+        # the engine keeps the last voice's conditioning (and its prompt name) between calls; a network voice must not
+        # stay in a long-lived process after its job
+        for attr in ("cache_spk_cond", "cache_s2mel_style", "cache_s2mel_prompt", "cache_spk_audio_prompt",
+                     "cache_emo_cond", "cache_emo_audio_prompt", "cache_mel"):
+            if hasattr(tts, attr):
+                setattr(tts, attr, None)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     shutil.rmtree(tmp, ignore_errors=True)
     summary = {"batch_file": str(batch.resolve()), "output_dir": str(out.resolve()), "engine": ENGINE,
                "total_items": len(rows), "newly_generated": done, "skipped_valid": skipped, "failed": failed,
@@ -612,7 +774,8 @@ def _prune_ref_cache(cache_dir, days=REF_CACHE_DAYS):
 def serve(device="cuda", ref_cache=None, stdin=None, load=None, runner=None):
     """Load the model once, then make one batch per request line read from stdin, so a run of jobs does not pay the
     several-GB model load each time. Protocol (one JSON object per line):
-        {"batch_file": ..., "output_dir": ..., "references": ..., "bitrate": ...}
+        {"batch_file": ..., "output_dir": ..., "references": <folder>, "bitrate": ...}
+    or, for a network job, "refs": {clip name: base64 bytes} in place of "references", so the clips stay in memory.
     Prints READY_MARKER once the model is loaded and "[JOB-DONE] rc=<n>" after each request; end of stdin is a clean
     exit (0). Any exception that escapes a batch (a GPU fault, or anything unforeseen) ends the process (exit 3) after
     its marker: the caller starts a fresh one for the next job, as the one-process-per-job mode always did.
@@ -620,8 +783,7 @@ def serve(device="cuda", ref_cache=None, stdin=None, load=None, runner=None):
     stdin = sys.stdin.buffer if stdin is None else stdin
     runner = run_batch if runner is None else runner
     cache = Path(ref_cache).resolve() if ref_cache else (Path.cwd() / "ref_wav_cache").resolve()
-    cache.mkdir(parents=True, exist_ok=True)
-    _prune_ref_cache(cache)
+    _prune_ref_cache(cache)      # made by prepare_reference only when a request names a folder of clips
     if load is None:
         if device == "cuda" and not torch.cuda.is_available():
             print("[FATAL] CUDA requested but not available.", file=sys.stderr, flush=True)
@@ -642,15 +804,19 @@ def serve(device="cuda", ref_cache=None, stdin=None, load=None, runner=None):
         try:
             req = json.loads(line)
             if not isinstance(req, dict) or not all(isinstance(req.get(k), str) and req.get(k)
-                                                    for k in ("batch_file", "output_dir", "references")):
+                                                    for k in ("batch_file", "output_dir")):
+                raise ValueError("batch_file, output_dir and references are required")
+            references = refs_from_json(req["refs"]) if "refs" in req else req.get("references")
+            if not references or not isinstance(references, (str, dict)):
                 raise ValueError("batch_file, output_dir and references are required")
         except ValueError as e:
             print(f"[serve] request refused: {e}", file=sys.stderr)
             done(2)
             continue
         try:
-            rc = runner(tts, req["batch_file"], req["output_dir"], req["references"], str(req.get("bitrate") or "32k"),
+            rc = runner(tts, req["batch_file"], req["output_dir"], references, str(req.get("bitrate") or "32k"),
                         device=device, ref_cache=cache)
+            references = req = None
         except BaseException:
             import traceback
             traceback.print_exc()
@@ -658,6 +824,111 @@ def serve(device="cuda", ref_cache=None, stdin=None, load=None, runner=None):
             return 3
         done(int(rc or 0))
     return 0
+
+
+# gpt.pth ships as float32 (3.5 GB), and with use_fp16 (always, on a CUDA card) infer_v2 calls gpt.half() straight after
+# loading it, so the model only ever runs on the float16 rounding of those weights. Storing that rounding instead halves
+# the file and makes the same model: load_state_dict widens each float16 value exactly, and .half() narrows it back to
+# the same float16. The other checkpoints (s2mel, w2v-bert, BigVGAN, ...) run in float32 and are left alone.
+# FP16_NOTE (a dot file, so it is outside the model hash's file list) records the float32 file's sha256 and size, which
+# net_worker.compute_model_hash reports in place of the converted file's, so the hash every job is pinned to holds.
+FP16_NOTE = ".fp16.json"
+SHRINK_FILES = ("gpt.pth",)
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def shrink_model(model_dir):
+    """Store SHRINK_FILES as float16, once. -> 0 when converted or nothing to do, 1 on a failure (the float32 file is
+    then untouched). Every converted tensor is read back and compared with the float16 rounding of the original before
+    the original is replaced, and the note is written before the replace, so a stop at any point leaves a model that
+    works and hashes as it should."""
+    d = Path(model_dir).resolve()
+    note_path = d / FP16_NOTE
+    try:
+        note = json.loads(note_path.read_text(encoding="utf-8"))
+        if not isinstance(note, dict):
+            note = {}
+    except (OSError, ValueError):
+        note = {}
+    rc = 0
+    for name in SHRINK_FILES:
+        src = d / name
+        if not src.is_file():
+            continue
+        size = src.stat().st_size
+        if (note.get(name) or {}).get("fp16_size") == size:
+            print(f"[shrink] {name} is already float16", flush=True)
+            continue
+        if shutil.disk_usage(d).free < size * 0.6 + 512 * 1024 ** 2:
+            print(f"[shrink] {name}: not enough free space to convert, left as it is", flush=True)
+            continue
+        part = d / f"{name}.{os.getpid()}.part"
+        try:
+            orig_sha = _sha256(src)
+            try:
+                ck = torch.load(str(src), map_location="cpu", mmap=True)
+            except (RuntimeError, TypeError):
+                ck = torch.load(str(src), map_location="cpu")
+            sd = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+            if not isinstance(sd, dict) or not all(torch.is_tensor(v) for v in sd.values()):
+                print(f"[shrink] {name}: not a plain state dict, left as it is", flush=True)
+                continue
+            # clone: a tensor still backed by the mmap would keep gpt.pth open, and Windows cannot replace an open file
+            half = {k: (v.half() if v.dtype == torch.float32 else v.clone()) for k, v in sd.items()}
+            if not any(v.dtype == torch.float32 for v in sd.values()):
+                print(f"[shrink] {name}: holds no float32 weights, left as it is", flush=True)
+                continue
+            out = dict(ck, model=half) if sd is not ck else half
+            torch.save(out, str(part))
+            del ck, sd, out
+            back = torch.load(str(part), map_location="cpu")
+            back = back["model"] if isinstance(back, dict) and "model" in back else back
+            if back.keys() != half.keys() or not all(back[k].dtype == half[k].dtype and torch.equal(back[k], half[k])
+                                                     for k in half):
+                raise RuntimeError("the float16 file does not read back as written")
+            del back, half
+            import gc
+            gc.collect()
+            note[name] = {"sha256": orig_sha, "size": size, "fp16_sha256": _sha256(part), "fp16_size": part.stat().st_size}
+            tmp = note_path.with_name(note_path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(note, indent=2), encoding="utf-8")
+            os.replace(str(tmp), str(note_path))
+            os.replace(str(part), str(src))
+            print(f"[shrink] {name}: {size / 1e9:.2f} GB -> {note[name]['fp16_size'] / 1e9:.2f} GB", flush=True)
+        except Exception as e:              # noqa: BLE001 - any failure leaves the float32 file in place
+            print(f"[shrink] {name}: not converted: {e}", file=sys.stderr, flush=True)
+            rc = 1
+        finally:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+    return rc
+
+
+def refs_from_json(obj):
+    """{clip name: base64} -> {clip name: bytes}. Raises ValueError on any other shape. Names are bare file names."""
+    import base64
+    import binascii
+    if not isinstance(obj, dict) or not obj:
+        raise ValueError("refs must be an object of clip name -> base64")
+    out = {}
+    for name, b64 in obj.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[0-9a-f]{64}\.(ogg|wav)", name) or not isinstance(b64, str):
+            raise ValueError("refs must be an object of clip name -> base64")
+        try:
+            out[name] = bytearray(base64.b64decode(b64, validate=True))
+            pin(out[name])
+        except (binascii.Error, ValueError):
+            raise ValueError(f"refs[{name[:12]}] is not base64") from None
+    return out
 
 
 def no_error_boxes():
@@ -675,6 +946,7 @@ def no_error_boxes():
 
 def main():
     no_error_boxes()
+    no_core_dumps()
     ap = argparse.ArgumentParser(description="IndexTTS-2 worker")
     ap.add_argument("--batch-file")
     ap.add_argument("--output-dir")
@@ -683,12 +955,24 @@ def main():
     ap.add_argument("--bitrate", default="32k")
     ap.add_argument("--serve", action="store_true", help="keep the model loaded; read one batch request per stdin line")
     ap.add_argument("--ref-cache", help="serve mode: folder that keeps converted references between batches")
+    ap.add_argument("--shrink-model", metavar="DIR", help="store gpt.pth as float16 (the same model, half the size)")
+    ap.add_argument("--refs-stdin", action="store_true",
+                    help="read the clips as one JSON line {name: base64} from stdin and keep them in memory")
     a = ap.parse_args()
+    if a.shrink_model:
+        return shrink_model(a.shrink_model)
     if a.serve:
         return serve(a.device, a.ref_cache)
     if not a.batch_file or not a.output_dir:
         ap.error("--batch-file and --output-dir are required (or --serve)")
-    return run_batch(None, a.batch_file, a.output_dir, a.references, a.bitrate, device=a.device)
+    references = a.references
+    if a.refs_stdin:
+        try:
+            references = refs_from_json(json.loads(sys.stdin.buffer.readline().decode("utf-8")))
+        except ValueError as e:
+            print(f"[FATAL] --refs-stdin: {e}", file=sys.stderr)
+            return 1
+    return run_batch(None, a.batch_file, a.output_dir, references, a.bitrate, device=a.device)
 
 
 if __name__ == "__main__":

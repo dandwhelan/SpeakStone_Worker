@@ -45,7 +45,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.2.26"
+WORKER_VERSION = "1.2.27"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
@@ -79,6 +79,7 @@ VRAM_POLL_SECONDS = 30
 GPU_FATAL_WAIT_SECONDS = 60
 MAX_RESULT_BYTES = 16 * 1024 * 1024   # 4 MB until 1.2.20; a lossless clip is ~8x a 32k one
 MAX_REF_BYTES = 20 * 1024 * 1024
+MAX_REFS_TOTAL_BYTES = 64 * 1024 * 1024    # a job's clips are held in memory (briefly ~3x, as base64 for the engine); real ones are ~100 KB each
 MAX_RESUME = 8
 YIELD_CHECK_SECONDS = 10    # spec 12a, yield
 YIELD_POLL_SECONDS = 20
@@ -318,10 +319,7 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-LOG_KEEP_DAYS = 14
-REFS_LIMIT_BYTES = 1024 ** 3        # the downloaded reference clips are a cache; over this size the oldest-used go
-REFS_TARGET_BYTES = 800 * 1024 ** 2
-PART_MAX_AGE = 86400                # a half-finished download older than this is never going to be finished
+LOG_KEEP_DAYS = 3       # 14 until 1.2.27: a log names jobs and timings, and older ones help nobody
 
 
 def prune_logs(log_dir, now=None, days=LOG_KEEP_DAYS):
@@ -341,42 +339,185 @@ def prune_logs(log_dir, now=None, days=LOG_KEEP_DAYS):
     return n
 
 
-def prune_refs(refs_dir, now=None, limit=REFS_LIMIT_BYTES, target=REFS_TARGET_BYTES):
-    """Trim the reference-clip cache: remove *.part files older than a day, and when the rest is over `limit` bytes
-    remove the least recently used (newest of access and modify time) until it is under `target`. Called only at
-    start, before any job is claimed, so no job in hand needs a file that goes (a missing one is fetched again anyway).
-    -> how many files were removed. Never raises."""
+STORED_REF_DIRS = ("refs", "ref_wav_cache")   # where clips were kept on disk before 1.2.27
+
+
+def wipe_stored_refs(work):
+    """Delete the reference-clip folders older versions kept in the work folder. Clips now live only in memory for
+    the job that needs them, so a voice is never left on the machine. -> how many folders were removed. Never raises."""
     removed = 0
+    for name in STORED_REF_DIRS:
+        d = Path(work) / name
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 0 if d.exists() else 1
+    return removed
+
+
+# ----------------------------------------------------------------------------------------------- voices kept off disk
+# A reference clip is a person's voice and lives only in memory for its job (1.2.27). The OS may still write memory to
+# disk: to swap when RAM runs short, or as a core dump when a process crashes. pin() asks it to keep a buffer in RAM
+# (mlock / VirtualLock) and release() wipes and unpins it when the job ends. Python makes passing copies this cannot
+# reach (a base64 string on its way to the engine, ffmpeg's pipe), so this narrows the window rather than closing it;
+# every call is best effort and never raises. The same helpers live in indextts2_worker.py; change both together.
+_PINNED = {}
+
+
+def no_core_dumps():
+    """A crash must not write the process's memory, voices included, to a core file. RLIMIT_CORE, not
+    PR_SET_DUMPABLE: a non-dumpable process hides /proc/<pid>/exe, which the app reads to know its worker is running."""
     try:
-        now = time.time() if now is None else now
-        files = []
-        for e in os.scandir(refs_dir):
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+def _span(buf):
+    import ctypes
+    if isinstance(buf, bytearray):
+        n = len(buf)
+        return (ctypes.addressof((ctypes.c_char * n).from_buffer(buf)) if n else 0), n
+    return int(buf.ctypes.data), int(buf.nbytes)          # a numpy array
+
+
+def pin(buf):
+    """Keep buf (a bytearray or numpy array) out of swap. -> True when the OS agreed."""
+    try:
+        import ctypes
+        addr, n = _span(buf)
+        if not n:
+            return False
+        if os.name == "nt":
+            k = ctypes.windll.kernel32
+            k.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            ok = bool(k.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(n)))
+            if not ok:                                   # the working-set minimum is too small: grow it, try once more
+                lo, hi = ctypes.c_size_t(), ctypes.c_size_t()
+                h = k.GetCurrentProcess()
+                if k.GetProcessWorkingSetSize(h, ctypes.byref(lo), ctypes.byref(hi)):
+                    k.SetProcessWorkingSetSize(h, ctypes.c_size_t(lo.value + n + (1 << 20)),
+                                               ctypes.c_size_t(max(hi.value, lo.value + n + (1 << 21))))
+                    ok = bool(k.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(n)))
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            ok = libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(n)) == 0
+        if ok:
+            _PINNED[id(buf)] = (addr, n)
+        return ok
+    except Exception:                                    # noqa: BLE001 - best effort by design
+        return False
+
+
+def release(buf):
+    """Overwrite buf with zeros and unpin it. Safe on a buffer that was never pinned."""
+    try:
+        if isinstance(buf, bytearray):
+            buf[:] = bytes(len(buf))
+        else:
+            buf.fill(0)
+    except Exception:                                    # noqa: BLE001
+        pass
+    span = _PINNED.pop(id(buf), None)
+    if not span:
+        return
+    try:
+        import ctypes
+        if os.name == "nt":
+            k = ctypes.windll.kernel32
+            k.VirtualUnlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            k.VirtualUnlock(ctypes.c_void_p(span[0]), ctypes.c_size_t(span[1]))
+        else:
+            libc = ctypes.CDLL(None)
+            libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            libc.munlock(ctypes.c_void_p(span[0]), ctypes.c_size_t(span[1]))
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+REF_KEY_DOMAIN = b"speakstone ref v1\0"
+
+
+def decrypt_ref(data, key):
+    """A clip stored encrypted in R2 (the site's lib/refcrypt.ts; change both): data XOR SHAKE256(domain || key)
+    truncated to its length. Decrypts `data` (a bytearray) in place, so the plain clip lands in the buffer that is
+    already pinned and is wiped with the job. The integer XOR runs in C; its temporary copies are released at once."""
+    if len(key) != 32:
+        raise ValueError("a reference key is 32 bytes")
+    n = len(data)
+    if not n:
+        return data
+    stream = hashlib.shake_256(REF_KEY_DOMAIN + bytes(key)).digest(n)
+    data[:] = (int.from_bytes(data, "big") ^ int.from_bytes(stream, "big")).to_bytes(n, "big")
+    return data
+
+
+LEFTOVER_MIN_AGE = 86400     # a cache or half-written file younger than this may belong to a setup still running
+
+
+def _tree_bytes(path):
+    total = 0
+    for cur, _dirs, files in os.walk(path):
+        for fn in files:
             try:
-                if not e.is_file():
-                    continue
-                st = e.stat()
-                if e.name.endswith(".part"):
-                    if now - st.st_mtime > PART_MAX_AGE:
-                        os.unlink(e.path)
-                        removed += 1
-                    continue
-                files.append((max(st.st_atime, st.st_mtime), st.st_size, e.path))
+                total += os.lstat(os.path.join(cur, fn)).st_size
             except OSError:
                 pass
-        total = sum(f[1] for f in files)
-        if total > limit:
-            for _, size, path in sorted(files):
-                if total <= target:
-                    break
-                try:
-                    os.unlink(path)
-                    total -= size
-                    removed += 1
-                except OSError:
-                    pass
+    return total
+
+
+def cleanup_after_update(work, install, model_dir, now=None):
+    """What an older version left on the PC that this one no longer wants, removed each start (cheap when there is
+    nothing to do, and the first start after an update is when there is). -> bytes freed. Never raises.
+      - refs/ and ref_wav_cache/ in the work folder: voices kept on disk before 1.2.27
+      - uv_cache/ in the install: wheels only a re-install needs, which an interrupted setup could leave behind
+      - *.part files in the model folder: a model conversion that was stopped part-way"""
+    now = time.time() if now is None else now
+    freed = 0
+    try:
+        for name in STORED_REF_DIRS:
+            d = Path(work) / name
+            if d.is_dir():
+                freed += _tree_bytes(d)
+        wipe_stored_refs(work)
+        uv = Path(install) / "uv_cache"
+        if uv.is_dir() and now - uv.stat().st_mtime > LEFTOVER_MIN_AGE:
+            n = _tree_bytes(uv)
+            shutil.rmtree(uv, ignore_errors=True)
+            freed += 0 if uv.exists() else n
+        for e in os.scandir(model_dir):
+            if e.is_file() and e.name.endswith(".part") and now - e.stat().st_mtime > LEFTOVER_MIN_AGE:
+                n = e.stat().st_size
+                os.unlink(e.path)
+                freed += n
     except OSError:
         pass
-    return removed
+    freed += drop_unused_packages(install)
+    return freed
+
+
+UNUSED_PACKAGES = ("triton",)    # the same list as setup.py's: only torch.compile uses it, and the engine never does
+
+
+def drop_unused_packages(install, run=subprocess.run):
+    """Linux installs made before 1.2.27 still carry UNUSED_PACKAGES; uninstall them with the install's own uv.
+    -> bytes freed. Never raises."""
+    if os.name == "nt":
+        return 0
+    install = Path(install)
+    uv, py = install / "tools" / "uv", install / "venv" / "bin" / "python"
+    try:
+        dirs = [d for p in UNUSED_PACKAGES for d in install.glob(f"venv/lib/python*/site-packages/{p}")]
+        if not dirs or not uv.exists() or not py.exists():
+            return 0
+        before = sum(_tree_bytes(d) for d in dirs)
+        run([str(uv), "pip", "uninstall", "--python", str(py), *UNUSED_PACKAGES], capture_output=True, timeout=300,
+            env={**os.environ, "UV_CACHE_DIR": str(install / "uv_cache_tmp")})
+        shutil.rmtree(install / "uv_cache_tmp", ignore_errors=True)
+        return before if not any(d.exists() for d in dirs) else 0
+    except (OSError, subprocess.SubprocessError):
+        return 0
 
 
 def stall_seconds(env=None):
@@ -618,8 +759,24 @@ def list_model_files(model_dir):
     return out
 
 
+FP16_NOTE = ".fp16.json"     # written by indextts2_worker.py --shrink-model; the same name lives there
+
+
+def read_fp16_note(model_dir):
+    """{relpath: {sha256, size, fp16_sha256, fp16_size}} for checkpoints stored as float16, else {}. Never raises."""
+    try:
+        note = json.loads((Path(model_dir) / FP16_NOTE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return note if isinstance(note, dict) else {}
+
+
 def compute_model_hash(model_dir, cache_path=None, hash_file=sha256_file, progress=None):
+    """The model's identity, which every job is pinned to. A checkpoint stored as float16 (indextts2_worker.py
+    --shrink-model) makes the same model as its float32 original, so it is hashed as that original: the note gives the
+    original's sha256 and size, used only when the file on disk is exactly the float16 file the note describes."""
     files = list_model_files(model_dir)
+    note = read_fp16_note(model_dir)
     if cache_path:
         try:
             cached = json.loads(Path(cache_path).read_text(encoding="utf-8"))
@@ -631,7 +788,12 @@ def compute_model_hash(model_dir, cache_path=None, hash_file=sha256_file, progre
     for i, (rel, size, _mt) in enumerate(files):
         if progress:
             progress(i, len(files), rel)
-        lines.append(f"{hash_file(os.path.join(str(model_dir), *rel.split('/')))} {size} {rel}\n")
+        digest = hash_file(os.path.join(str(model_dir), *rel.split('/')))
+        n = note.get(rel)
+        if (isinstance(n, dict) and n.get("fp16_sha256") == digest and n.get("fp16_size") == size
+                and HASH_RE.match(str(n.get("sha256", ""))) and isinstance(n.get("size"), int)):
+            digest, size = n["sha256"], n["size"]
+        lines.append(f"{digest} {size} {rel}\n")
     h = "sha256:" + hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
     if cache_path:
         try:
@@ -808,14 +970,17 @@ def http_request(method, url, headers=None, data=None, timeout=30, max_bytes=MAX
         raise NetError(describe_exc(e)) from None
 
 
-def download_verified(url, dest_part, expected_bytes, expected_sha, timeout=60):
-    """Stream a presigned GET to dest_part (no Authorization header). -> (bytes, sha256). Raises NetError.
-    Never writes more than expected_bytes + REF_MARGIN_BYTES; a longer stream makes the returned count exceed expected_bytes."""
+def download_verified(url, expected_bytes, expected_sha, timeout=60):
+    """Read a presigned GET into memory (no Authorization header). -> (bytes read, sha256, data as a bytearray, so the
+    caller can pin and later wipe it). Raises NetError.
+    Never holds more than expected_bytes + REF_MARGIN_BYTES; a longer stream makes the returned count exceed
+    expected_bytes. Nothing is written to disk: a reference is a person's voice and is kept only while a job uses it."""
     check_url(url)
     req = urllib.request.Request(url, method="GET")
     h = hashlib.sha256()
     n = 0
     cap = int(expected_bytes) + REF_MARGIN_BYTES
+    buf = bytearray()
     try:
         with _opener(url).open(req, timeout=timeout) as r:
             try:
@@ -823,24 +988,23 @@ def download_verified(url, dest_part, expected_bytes, expected_sha, timeout=60):
             except (TypeError, ValueError):
                 declared = None
             if declared is not None and declared > cap:
-                return declared, ""                  # refused before reading a byte
-            with open(dest_part, "wb") as f:
-                while True:
-                    chunk = r.read(1 << 16)
-                    if not chunk:
-                        break
-                    n += len(chunk)
-                    if n > cap:                      # longer than declared: stop, the caller reports a mismatch
-                        break
-                    h.update(chunk)
-                    f.write(chunk)
+                return declared, "", b""             # refused before reading a byte
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                n += len(chunk)
+                if n > cap:                          # longer than declared: stop, the caller reports a mismatch
+                    break
+                h.update(chunk)
+                buf += chunk
     except urllib.error.HTTPError as e:
         raise NetError(f"HTTP {e.code}") from None
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
         raise NetError(describe_exc(e)) from None
     except Exception as e:
         raise NetError(describe_exc(e)) from None
-    return n, h.hexdigest()
+    return n, h.hexdigest(), buf
 
 
 def _pid_alive(pid):
@@ -860,19 +1024,61 @@ def _pid_alive(pid):
         return True
 
 
+def _pid_started(pid):
+    """When process `pid` started, as epoch seconds, or None when it cannot be told. Never raises."""
+    try:
+        pid = int(pid)
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            h = k.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return None
+            try:
+                times = [wintypes.FILETIME() for _ in range(4)]
+                if not k.GetProcessTimes(h, *[ctypes.byref(t) for t in times]):
+                    return None
+                ft = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+                return ft / 1e7 - 11644473600                     # 100 ns ticks since 1601 -> epoch
+            finally:
+                k.CloseHandle(h)
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            ticks = int(f.read().rsplit(b")", 1)[1].split()[19])   # field 22, starttime, after the (comm) field
+        with open("/proc/stat", "rb") as f:
+            boot = next(int(line.split()[1]) for line in f if line.startswith(b"btime"))
+        return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+
+LOCK_START_SLACK = 5         # seconds of clock noise between a process starting and its lock file's time
+
+
 def lock_held(path):
-    """Another program's GPU lock: held if the file exists and its last token is a live PID, or it has
-    no PID and is younger than 3 h. A lock whose text contains the word no_gpu is not held: its owner is busy
-    with something that leaves the card alone (packing, uploading). Never created, held or deleted here."""
+    """Another program's GPU lock: held if the file exists and its last token is the PID of the live process that
+    wrote it, or it has no PID and is younger than 3 h. A lock whose text contains the word no_gpu is not held: its
+    owner is busy with something that leaves the card alone (packing, uploading). Never created, held or deleted here.
+
+    A PID alone proved little: Windows reuses them quickly, so a lock left behind by a crashed run pointed at whatever
+    program got that number next (once, the worker's own engine), and the worker stood aside for ever. A process that
+    started after the file was last written cannot be the one that wrote it, and this worker never yields to
+    itself. When the start time cannot be read, a live PID still counts, as before."""
     try:
         p = Path(path)
-        text, age = p.read_text(encoding="utf-8", errors="replace").split(), time.time() - p.stat().st_mtime
+        text, mtime = p.read_text(encoding="utf-8", errors="replace").split(), p.stat().st_mtime
     except OSError:
         return False
     if "no_gpu" in text:                 # the holder says this stretch of its work does not use the card: carry on
         return False
     pid = text[-1] if text and text[-1].isdigit() else None
-    return _pid_alive(pid) if pid else age < 3 * 3600
+    if not pid:
+        return time.time() - mtime < 3 * 3600
+    if int(pid) == os.getpid() or not _pid_alive(pid):
+        return False
+    started = _pid_started(pid)
+    return started is None or started <= mtime + LOCK_START_SLACK
 
 
 class InstanceLock:
@@ -1078,6 +1284,8 @@ def check_payload(p):
                     or not isinstance(r.get("text", ""), str)):
                 return "bad_job", "a reference entry is invalid"
             known.add(r["sha256"])
+        if sum(r["bytes"] for r in refs) > MAX_REFS_TOTAL_BYTES:
+            return "bad_job", "the references are too large to hold in memory"
         for n, ln in enumerate(lines):
             if (not isinstance(ln, dict) or ln.get("i") != n or not isinstance(ln.get("text"), str) or not ln["text"]
                     or ln.get("ref") not in known or not isinstance(ln.get("seed"), int)
@@ -1088,6 +1296,9 @@ def check_payload(p):
             why = _post_af_problem(ln.get("post_af", ""))
             if why:
                 return "bad_job", f"line {n} post_af refused: {why}"
+        # Every listed clip is downloaded, so one no line speaks with is a voice this machine has no need to receive.
+        if known - {ln["ref"] for ln in lines}:
+            return "bad_job", "a reference is used by no line"
     except (TypeError, AttributeError):
         return "bad_job", "payload shape is invalid"
     return None
@@ -1164,6 +1375,7 @@ class JobCtx:
         self.worker = None
         self.oom_tries = 0           # engine restarts after "out of memory" in this job (one is allowed)
         self.grace_until = None      # set once every line is made: from then on only a lost lease may abort
+        self.refs = {}               # clip name -> bytes, in memory only, for this job's runs
         self.load_s = 0.0            # engine start to ready, summed over this job's runs (0 when a loaded one was reused)
         self.synth_s = 0.0           # time spent in run_synth, summed over this job's runs
         self.stall_limit = None      # seconds without progress that end a run; None = not watching (set by run_synth)
@@ -1448,7 +1660,6 @@ class Worker:
         set_transfer_policy(cfg.api_base)
         self.work = cfg.work_dir
         self.jobs_dir = self.work / "jobs"
-        self.refs_dir = self.work / "refs"
         self.log = log or Log(self.work / "logs", cfg.worker_key)
         self.api = Api(cfg.api_base, cfg.worker_key, bypass=getattr(cfg, "vercel_bypass", ""))
         self.gpu_query = gpu_query
@@ -1500,7 +1711,7 @@ class Worker:
 
     def serve_command(self):
         script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
-        return [self.cfg.python, script, "--serve", "--ref-cache", os.path.abspath(str(self.work / "ref_wav_cache"))]
+        return [self.cfg.python, script, "--serve"]
 
     def engine_host(self):
         if getattr(self, "engine", None) is None:
@@ -1641,15 +1852,21 @@ class Worker:
                 "audio_sec_per_hour": round(self.session_audio / hours, 1)}
         return {k: v for k, v in live.items() if v is not None and k in LIVE_KEYS}
 
+    def anonymous(self):
+        return getattr(self, "tier", None) == "public"
+
     def claim_body(self, resume):
         g = self.gpu_query() or {}
-        # a public-tier key belongs to an anonymous volunteer: their computer's name is not sent
-        name = "worker" if getattr(self, "tier", None) == "public" else self.cfg.machine_name
+        # a public-tier key belongs to an anonymous volunteer: their computer's name, card model and OS build are not
+        # sent, only what scheduling needs (memory, load) and the OS family
+        anon = self.anonymous()
+        name = "worker" if anon else self.cfg.machine_name
         body = {"worker_version": WORKER_VERSION, "engines": [ENGINE], "recipes": [RECIPE],
                 "model_hash": self.model_hash, "model_revision": self.revision[:80],
-                "machine_name": name, "os": os_string(), "resume": resume}
-        for k_body, k_g in (("gpu", "name"), ("vram_total_mib", "vram_total_mib"), ("vram_free_mib", "vram_free_mib"),
-                            ("gpu_util", "gpu_util")):
+                "machine_name": name, "os": os_family() if anon else os_string(), "resume": resume}
+        fields = (("gpu", "name"), ("vram_total_mib", "vram_total_mib"), ("vram_free_mib", "vram_free_mib"),
+                  ("gpu_util", "gpu_util"))
+        for k_body, k_g in fields[1:] if anon else fields:
             if g.get(k_g) is not None:
                 body[k_body] = g[k_g]
         return body
@@ -1691,6 +1908,32 @@ class Worker:
             self.delete_job_dir(jid)
         return ids[:MAX_RESUME]
 
+    SHRINK_TIMEOUT = 1800
+
+    def shrink_model(self, mdir):
+        """Once per install: store gpt.pth as float16 (1.7 GB saved, the same model). Needs torch, so it runs in the
+        engine's Python. A second worker on the same install that starts meanwhile simply finds the file still float32
+        and hashes it as such; the result is the same hash. SSW_SHRINK_MODEL=0 turns it off. Never raises."""
+        if os.environ.get("SSW_SHRINK_MODEL", "1") == "0":
+            return
+        note = read_fp16_note(mdir).get("gpt.pth") or {}
+        try:
+            if not (mdir / "gpt.pth").is_file() or note.get("fp16_size") == (mdir / "gpt.pth").stat().st_size:
+                return
+        except OSError:
+            return
+        script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
+        self.log.event("model", None, state="shrinking")
+        t0 = time.time()
+        try:
+            r = subprocess.run([self.cfg.python, script, "--shrink-model", str(mdir)], env=self.synth_env(),
+                               capture_output=True, text=True, timeout=self.SHRINK_TIMEOUT)
+            ok, why = r.returncode == 0, (r.stderr or r.stdout or "").strip().splitlines()[-1:] or [""]
+        except (OSError, subprocess.SubprocessError) as e:
+            ok, why = False, [describe_exc(e)]
+        self.log.event("model", None, state="shrunk" if ok else "shrink_failed", seconds=round(time.time() - t0, 1),
+                       **({} if ok else {"error": why[0][:160]}))
+
     # ---- startup (8.3 step 1)
     def startup(self):
         mdir = Path(self.cfg.model_dir)
@@ -1698,10 +1941,12 @@ class Worker:
             raise ExitRun(EXIT_MODEL, f"model dir missing or incomplete: {mdir}")
         self.work.mkdir(parents=True, exist_ok=True)
         self.clear_drain()                      # a drain file left from an earlier run must not stop this one
-        for d in (self.jobs_dir, self.refs_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
         prune_logs(self.log.dir)                # housekeeping, only here: before any job is claimed
-        prune_refs(self.refs_dir)
+        freed = cleanup_after_update(self.work, Path(__file__).resolve().parent, mdir)
+        if freed:
+            self.log.event("cleanup", None, freed_mb=round(freed / 1024 ** 2))
+        self.shrink_model(mdir)
         self.log.event("start", None, version=WORKER_VERSION, protocol=PROTOCOL, machine=self.cfg.machine_name,
                        key=mask_key(self.cfg.worker_key), api=self.cfg.api_base)
         self.model_hash = compute_model_hash(mdir, self.work / "model_hash.json")
@@ -1954,6 +2199,9 @@ class Worker:
                                                       True, True))
         finally:
             hb.stop()
+            for data in ctx.refs.values():          # the voices go with the job, whatever way it ended
+                release(data)
+            ctx.refs.clear()
             self._current = None
         if after_wait:
             self.log.event("idle", None, reason="failed_job", wait=after_wait)
@@ -2150,27 +2398,40 @@ class Worker:
 
     # ---- refs (8.3 step 5)
     def ensure_refs(self, ctx, ref_urls):
-        self.refs_dir.mkdir(parents=True, exist_ok=True)
+        """Fetch the job's clips into ctx.refs, in memory. Each is fetched once per job, when the job starts, and goes
+        with the job: nothing is written to disk and nothing is kept for a later job."""
         for r in ctx.payload["refs"]:
             sha, ext, size = r["sha256"], r["ext"], r["bytes"]
-            dest = self.refs_dir / f"{sha}.{ext}"
-            if dest.is_file() and dest.stat().st_size == size:
+            name = f"{sha}.{ext}"
+            if name in ctx.refs:
                 continue
             entry = ref_urls.get(sha)
             url = entry.get("url") if isinstance(entry, dict) else None
             if not url:
                 raise JobFail("ref_download", "no download URL for a reference", True, True)
+            secret = None
+            if isinstance(entry, dict) and entry.get("key") is not None:
+                try:
+                    import base64
+                    secret = base64.b64decode(str(entry["key"]), validate=True)
+                except ValueError:
+                    secret = b""
+                if len(secret) != 32:
+                    raise JobFail("bad_job", "a reference key is invalid", False, True)
             try:
                 check_url(url)
             except NetError as e:
                 raise JobFail("ref_download", str(e)[:200], True, True) from None
-            part = dest.with_name(dest.name + ".part")
             last = ""
             for attempt in range(1, 4):
                 ctx.check()
                 t0 = time.time()
                 try:
-                    n, got = download_verified(url, part, size, sha)
+                    n, got, data = download_verified(url, size, sha)
+                    if secret is not None and n == size:     # encrypted at rest: the sha names the plain clip
+                        pin(data)
+                        decrypt_ref(data, secret)
+                        got = hashlib.sha256(data).hexdigest()
                 except NetError as e:
                     last = str(e)
                     self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], attempt=attempt, error=last)
@@ -2178,21 +2439,28 @@ class Worker:
                         self.sleep(2 * attempt, ctx)
                     continue
                 if n != size or got != sha:
-                    part.unlink(missing_ok=True)
+                    release(data)
                     self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], result="mismatch")
                     raise JobFail("ref_mismatch", "reference clip does not match its sha256", True, True)
-                os.replace(str(part), str(dest))
+                if secret is None:
+                    pin(data)
+                ctx.refs[name] = data
                 self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], bytes=n, seconds=round(time.time() - t0, 1))
                 break
             else:
-                part.unlink(missing_ok=True)
                 raise JobFail("ref_download", f"reference download failed: {last}"[:200], True, True)
+
+    @staticmethod
+    def refs_json(ctx):
+        """ctx.refs as the engine reads them: {clip name: base64}."""
+        import base64
+        return {name: base64.b64encode(data).decode("ascii") for name, data in ctx.refs.items()}
 
     # ---- the subprocess (8.3 step 7)
     def synth_command(self, ctx):
         script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
         return [self.cfg.python, script, "--batch-file", str(ctx.dir / "chunk.json"), "--output-dir", str(ctx.out),
-                "--references", str(self.refs_dir), "--bitrate", ctx.payload["settings"]["bitrate"]]
+                "--refs-stdin", "--bitrate", ctx.payload["settings"]["bitrate"]]
 
     def synth_env(self):
         env = dict(os.environ)
@@ -2231,9 +2499,10 @@ class Worker:
             ctx.stall_end()
 
     def engine_request(self, ctx):
-        """One serve-mode request. Absolute paths: the engine runs in the work folder, not in the job's folder."""
+        """One serve-mode request. Absolute paths: the engine runs in the work folder, not in the job's folder. The
+        clips travel inside the request, so they reach the engine through its stdin pipe and never touch the disk."""
         return {"batch_file": os.path.abspath(str(ctx.dir / "chunk.json")), "output_dir": os.path.abspath(str(ctx.out)),
-                "references": os.path.abspath(str(self.refs_dir)), "bitrate": ctx.payload["settings"]["bitrate"]}
+                "refs": self.refs_json(ctx), "bitrate": ctx.payload["settings"]["bitrate"]}
 
     def run_synth_kept(self, ctx):
         ctx.check()
@@ -2252,10 +2521,15 @@ class Worker:
         ctx.check()
         with open(ctx.dir / "worker.log", "ab") as lf:
             proc = subprocess.Popen(self.synth_command(ctx), cwd=str(ctx.dir), env=self.synth_env(),
-                                    stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.PIPE, stdout=lf, stderr=subprocess.STDOUT,
                                     **popen_tree_kwargs())
             ctx.proc = proc
             try:
+                try:                           # the clips go over the pipe, as in the kept engine's requests
+                    proc.stdin.write((json.dumps(self.refs_json(ctx)) + "\n").encode("utf-8"))
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass                       # the engine already exited; its exit code and log say why
                 while True:
                     try:
                         return proc.wait(timeout=0.25)
@@ -2409,13 +2683,17 @@ class Worker:
                               "qc_why": _s200(rec.get("why")) or "held by worker QC"})
         return {"v": 1, "worker_version": WORKER_VERSION, "model_hash": self.model_hash,
                 "model_revision": self.revision, "torch_version": _s200(torch_v) or "unknown",
-                "gpu": (self.gpu_query() or {}).get("name") or "unknown",
+                "gpu": None if self.anonymous() else ((self.gpu_query() or {}).get("name") or "unknown"),
                 "bitrate": ctx.payload["settings"]["bitrate"], "started_at": ctx.started_at,
                 "finished_at": utc_iso(), "lines": lines}
 
 
 def _s200(v):
     return None if v is None else str(v)[:200]
+
+
+def os_family():
+    return "windows" if platform.system().lower() == "windows" else "linux"
 
 
 def os_string():
@@ -2502,6 +2780,7 @@ def trust_bundled_certificates(ssl_module=None, where=None):
 
 def main(argv=None, env=None):
     no_error_boxes()
+    no_core_dumps()
     trust_bundled_certificates()
     args = build_parser().parse_args(argv)
     if args.command == "init":

@@ -64,7 +64,9 @@ class _Refused422(Exception):
 
 
 def _enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener, timeout, purpose):
-    fields = {"machine_name": machine_name, "gpu": gpu, "vram_mib": int(vram_mib), "os": os_name,
+    # Every enrolled key starts on the public tier, an anonymous volunteer's: the card model is not sent, only its
+    # memory (which decides whether it may make voice lines). The site does not store machine_name.
+    fields = {"machine_name": machine_name, "gpu": "", "vram_mib": int(vram_mib), "os": os_name,
               "worker_version": worker_version}
     if purpose:
         fields["purpose"] = purpose

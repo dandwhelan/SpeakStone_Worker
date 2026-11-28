@@ -761,7 +761,29 @@ def enroll_second(env):
                                                "tier": info.get("tier")}), encoding="utf-8")
 
 
+# Packages torch pulls in that the worker never uses. triton (about 540 MB) only backs torch.compile, which the engine
+# is never asked for; Linux wheels depend on it, Windows ones do not ship it. The torch libraries the engine does load
+# link NCCL, cuSPARSELt and cuFile directly (readelf on 2.8.0+cu128), so those stay although one card never needs NCCL.
+UNUSED_PACKAGES = ("triton",)
+
+
+def drop_unused_packages(env):
+    """Uninstall UNUSED_PACKAGES from the install's Python. Runs in the last step, after every install that could pull
+    them back in. Never fails the setup."""
+    if env.is_win or not env.uv.exists():
+        return
+    present = [p for p in UNUSED_PACKAGES if any(env.venv.glob(f"lib/python*/site-packages/{p}"))]
+    if present:
+        env.progress("check", None, "Removing unused packages: " + ", ".join(present))
+        try:
+            env.run([str(env.uv), "pip", "uninstall", "--python", str(env.py), *present], env.tool_env(), None,
+                    lambda ln: None)
+        except Exception:
+            pass
+
+
 def step_check(env):
+    drop_unused_packages(env)
     _run(env, "check", [env.py, "-c",
                         "import torch; assert torch.cuda.is_available(), 'no CUDA'; "
                         "print('graphics card ready:', torch.cuda.get_device_name(0))"])

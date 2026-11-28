@@ -1,6 +1,7 @@
 """net_worker.py core: what leaves the machine, the engine kept loaded between jobs (against a FAKE engine script,
 never the real model or a GPU), uploads, the finish grace, idle waits, stale job folders and the public-tier name.
 No network: the site API and the upload PUTs are fakes."""
+import base64
 import ast
 import hashlib
 import importlib.util
@@ -43,6 +44,9 @@ def make(batch, out):
 with open(os.path.join(state, "pids.txt"), "a") as f:
     f.write(f"{os.getpid()} {'serve' if '--serve' in args else 'once'} {os.getcwd()}\n")
 if "--serve" not in args:
+    if "--refs-stdin" in args:
+        with open(os.path.join(state, "once_refs.txt"), "a") as f:
+            f.write(sys.stdin.readline())
     make(args[args.index("--batch-file") + 1], args[args.index("--output-dir") + 1])
     sys.exit(0)
 print("loading model", flush=True)
@@ -103,8 +107,12 @@ def payload(n=3):
                        "post_af": ""} for i in range(n)]}
 
 
+REF_URL = "https://1.1.1.1/refs/ref.ogg?sig=1"     # never fetched: download_verified is replaced
+
+
 def job(job_id, n=3):
-    return {"id": job_id, "lease_id": "lease", "attempt": 1, "payload": payload(n), "heartbeat_every_seconds": 3600}
+    return {"id": job_id, "lease_id": "lease", "attempt": 1, "payload": payload(n), "heartbeat_every_seconds": 3600,
+            "ref_urls": {REF_SHA: {"url": REF_URL, "expires_at": "2099-01-01T00:00:00Z"}}}
 
 
 @pytest.fixture
@@ -151,9 +159,14 @@ def make_worker(tmp_path, monkeypatch, api=None, mode="", keep=True, gpu=None):
                   skip_vram_wait=False, install_signals=False)
     w.api = api or FakeApi()
     w.sleep_impl = lambda s, ctx=None: None
-    for d in (w.jobs_dir, w.refs_dir):
-        d.mkdir(parents=True, exist_ok=True)
-    (w.refs_dir / f"{REF_SHA}.ogg").write_bytes(REF)
+    w.jobs_dir.mkdir(parents=True, exist_ok=True)
+    fetched = []
+
+    def fake_download(url, size, sha, timeout=60):
+        fetched.append(url)
+        return len(REF), REF_SHA, bytearray(REF)
+    monkeypatch.setattr(nw, "download_verified", fake_download)
+    w.fetched = fetched
     return w, state
 
 
@@ -239,7 +252,10 @@ def test_two_jobs_reuse_one_engine_and_log_load_and_gen(tmp_path, monkeypatch, p
         assert [p[1] for p in pids(state)] == ["serve"]                 # one engine process for both jobs
         assert len((state / "reqs.txt").read_text().splitlines()) == 2
         reqs = [json.loads(x) for x in (state / "reqs.txt").read_text().splitlines()]
-        assert all(Path(r[k]).is_absolute() for r in reqs for k in ("batch_file", "output_dir", "references"))
+        assert all(Path(r[k]).is_absolute() for r in reqs for k in ("batch_file", "output_dir"))
+        assert all("references" not in r and r["refs"] == {f"{REF_SHA}.ogg": base64.b64encode(REF).decode()}
+                   for r in reqs)                                     # the clip rides in the request, not on disk
+        assert w.fetched == [REF_URL, REF_URL]                          # once per job, nothing kept between jobs
         assert pids(state) and (state / "pids.txt").read_text().split()[2] == str(w.work)   # stable cwd
         done = events(tmp_path, "complete")
         assert len(done) == 2 and "load_s=" in done[0] and "gen_s=" in done[0]
@@ -650,3 +666,68 @@ def test_a_text_only_key_stops_the_worker_instead_of_waiting():
         api._finish(403, body)
     assert e.value.code == nw.EXIT_KEY
     assert api._finish(403, b'{"reason": "paused"}')[0] == 403        # an ordinary 403 (paused) is unchanged
+
+
+# ------------------------------------------------------------------ references live in memory only (1.2.27)
+def _files_holding(root, needle):
+    return [p for p in Path(root).rglob("*") if p.is_file() and needle in p.read_bytes()]
+
+
+def test_a_job_leaves_no_reference_on_disk(tmp_path, monkeypatch, puts):
+    for keep in (True, False):
+        sub = tmp_path / ("kept" if keep else "once")
+        sub.mkdir()
+        w, state = make_worker(sub, monkeypatch, FakeApi([job(JOB1)]), keep=keep)
+        try:
+            w.cycle()
+            assert "complete" in w.api.routes()
+            assert not (w.work / "refs").exists() and not (w.work / "ref_wav_cache").exists()
+            assert _files_holding(w.work, REF) == [] and _files_holding(w.work, base64.b64encode(REF)) == []
+            if not keep:                                                  # the one-shot engine got it on stdin
+                got = json.loads((state / "once_refs.txt").read_text().splitlines()[0])
+                assert got == {f"{REF_SHA}.ogg": base64.b64encode(REF).decode()}
+        finally:
+            w.engine_shutdown("test")
+
+
+def test_a_reference_no_line_uses_is_refused():
+    p = payload()
+    p["refs"].append({"sha256": "e" * 64, "ext": "ogg", "bytes": 5, "text": ""})
+    assert nw.check_payload(p) == ("bad_job", "a reference is used by no line")
+    assert nw.check_payload(payload()) is None
+
+
+def test_references_too_large_for_memory_are_refused():
+    p = payload()
+    p["refs"] = [{"sha256": f"{i:064x}", "ext": "ogg", "bytes": nw.MAX_REF_BYTES, "text": ""} for i in range(14)]
+    for n, ln in enumerate(p["lines"]):
+        ln["ref"] = p["refs"][n]["sha256"]
+    p["lines"] += [dict(p["lines"][0], i=i, ref=p["refs"][i]["sha256"]) for i in range(3, 14)]
+    assert nw.check_payload(p) == ("bad_job", "the references are too large to hold in memory")
+
+
+def test_serve_takes_references_as_bytes(tmp_path, monkeypatch, capsys):
+    m = _load_engine_module(monkeypatch)
+    seen = []
+
+    def runner(tts, b, o, r, br, device, ref_cache):
+        seen.append(r)
+        return 0
+    name = "a" * 64 + ".ogg"
+    good = {"batch_file": "a", "output_dir": "o", "refs": {name: base64.b64encode(b"voice").decode()}}
+    bad_name = {"batch_file": "a", "output_dir": "o", "refs": {"../x.ogg": "dm9pY2U="}}
+    bad_b64 = {"batch_file": "a", "output_dir": "o", "refs": {name: "not base64!"}}
+    stdin = io.BytesIO(b"".join(json.dumps(x).encode() + b"\n" for x in (good, bad_name, bad_b64)))
+    assert m.serve("cpu", tmp_path / "cache", stdin=stdin, load=lambda: "TTS", runner=runner) == 0
+    assert capsys.readouterr().out.splitlines() == ["[ENGINE-READY]", "[JOB-DONE] rc=0", "[JOB-DONE] rc=2",
+                                                    "[JOB-DONE] rc=2"]
+    assert seen == [{name: b"voice"}]
+    assert not (tmp_path / "cache").exists()                            # no folder is made for in-memory clips
+
+
+def test_run_batch_in_memory_reports_a_missing_clip(tmp_path, monkeypatch, capsys):
+    m = _load_engine_module(monkeypatch)
+    (tmp_path / "chunk.json").write_text(json.dumps([{"model_engine": m.ENGINE, "canonical_reference_clip": "x.ogg",
+                                                      "sound_file": "L000.ogg"}]))
+    assert m.run_batch(None, tmp_path / "chunk.json", tmp_path / "out", {"y.ogg": b"v"}) == 1
+    assert "the job's memory" in capsys.readouterr().err

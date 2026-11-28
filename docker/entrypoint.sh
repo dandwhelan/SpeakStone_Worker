@@ -25,6 +25,7 @@ if python -c "import sys; sys.path.insert(0, '$HOME_DIR'); import fetch_models a
 else
     MODELS="$DATA/models"
     python "$HOME_DIR/fetch_models.py" "$MODELS"
+    # converted once on the data disk, which outlives the machine; the worker skips a model already converted
 fi
 
 export INDEXTTS2_DIR="$MODELS/IndexTTS-2"
