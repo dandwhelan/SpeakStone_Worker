@@ -1024,19 +1024,61 @@ def _pid_alive(pid):
         return True
 
 
+def _pid_started(pid):
+    """When process `pid` started, as epoch seconds, or None when it cannot be told. Never raises."""
+    try:
+        pid = int(pid)
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            h = k.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return None
+            try:
+                times = [wintypes.FILETIME() for _ in range(4)]
+                if not k.GetProcessTimes(h, *[ctypes.byref(t) for t in times]):
+                    return None
+                ft = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+                return ft / 1e7 - 11644473600                     # 100 ns ticks since 1601 -> epoch
+            finally:
+                k.CloseHandle(h)
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            ticks = int(f.read().rsplit(b")", 1)[1].split()[19])   # field 22, starttime, after the (comm) field
+        with open("/proc/stat", "rb") as f:
+            boot = next(int(line.split()[1]) for line in f if line.startswith(b"btime"))
+        return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+
+LOCK_START_SLACK = 5         # seconds of clock noise between a process starting and its lock file's time
+
+
 def lock_held(path):
-    """Another program's GPU lock: held if the file exists and its last token is a live PID, or it has
-    no PID and is younger than 3 h. A lock whose text contains the word no_gpu is not held: its owner is busy
-    with something that leaves the card alone (packing, uploading). Never created, held or deleted here."""
+    """Another program's GPU lock: held if the file exists and its last token is the PID of the live process that
+    wrote it, or it has no PID and is younger than 3 h. A lock whose text contains the word no_gpu is not held: its
+    owner is busy with something that leaves the card alone (packing, uploading). Never created, held or deleted here.
+
+    A PID alone proved little: Windows reuses them quickly, so a lock left behind by a crashed run pointed at whatever
+    program got that number next (once, the worker's own engine), and the worker stood aside for ever. A process that
+    started after the file was last written cannot be the one that wrote it, and this worker never yields to
+    itself. When the start time cannot be read, a live PID still counts, as before."""
     try:
         p = Path(path)
-        text, age = p.read_text(encoding="utf-8", errors="replace").split(), time.time() - p.stat().st_mtime
+        text, mtime = p.read_text(encoding="utf-8", errors="replace").split(), p.stat().st_mtime
     except OSError:
         return False
     if "no_gpu" in text:                 # the holder says this stretch of its work does not use the card: carry on
         return False
     pid = text[-1] if text and text[-1].isdigit() else None
-    return _pid_alive(pid) if pid else age < 3 * 3600
+    if not pid:
+        return time.time() - mtime < 3 * 3600
+    if int(pid) == os.getpid() or not _pid_alive(pid):
+        return False
+    started = _pid_started(pid)
+    return started is None or started <= mtime + LOCK_START_SLACK
 
 
 class InstanceLock:
